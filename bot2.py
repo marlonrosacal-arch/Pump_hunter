@@ -14,20 +14,13 @@ MOEDAS = ["IRYSUSDT","ZORAUSDT","OGUSDT","PENGUUSDT","PEPEUSDT","DOGEUSDT","SHIB
 def enviar(msg):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=15)
-        print(f"Telegram: {r.text}")
-        return r.text
-    except Exception as e:
-        print(f"ERRO: {e}")
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=15)
+    except:
+        pass
 
 @app.route('/')
 def home():
-    return "Bot 2 Rodando - /test para testar"
-
-@app.route('/test')
-def test():
-    res = enviar("✅ TESTE OK - Bot 2 funcionando!")
-    return f"Resposta: {res}"
+    return "Bot 2 - Pump Hunter Ativo!"
 
 def verificar():
     try:
@@ -36,13 +29,13 @@ def verificar():
         for moeda in MOEDAS:
             var = mapa.get(moeda, 0)
             if var >= 5:
-                enviar(f"🚀 *PUMP DETECTADO!* 🚀\n\nMoeda: `{moeda.replace('USDT','')}`\nAlta: *{var:.2f}%*")
+                enviar(f"🚀 *PUMP DETECTADO!* 🚀\n\nMoeda: `{moeda.replace('USDT','')}`\nAlta: *{var:.2f}%* em 24h\n\n👉 Checar na Binance!")
     except Exception as e:
         print(f"Erro: {e}")
 
 def loop_bot():
     time.sleep(5)
-    enviar("✅ Bot 2 - Caçador de Pumps iniciado! Monitorando 50 moedas.")
+    enviar("✅ *Bot 2 - Caçador de Pumps iniciado!*\nMonitorando 50 moedas.")
     while True:
         verificar()
         time.sleep(120)
