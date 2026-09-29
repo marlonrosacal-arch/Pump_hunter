@@ -15,8 +15,8 @@ app = Flask(__name__)
 # CONFIGURAÇÕES
 # ============================================================
 
-BOT_TOKEN = os.getenv("8523359888:AAFcISRXoEjnmXfPuaak5nZmT-N8o0mQ0ho")
-CHAT_ID = os.getenv("1475544551")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 # Quantidade de moedas monitoradas
 NUM_MOEDAS = 50
