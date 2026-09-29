@@ -14,45 +14,57 @@ from flask import Flask
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-MEXC_BASE = "https://api.mexc.com"
+# Endpoint oficial de Futures
+MEXC_BASE = "https://contract.mexc.com"
 
 MAX_CONTRATOS = 100
 
-# Coleta a cada 5 segundos
+# Coleta de preço a cada 5 segundos
 INTERVALO = 5
 
-# Atualiza a seleção de contratos
+# Atualização da lista de contratos
 ATUALIZAR_CONTRATOS = 15 * 60
 
-# Histórico
+# Histórico rápido
 HISTORICO_SEGUNDOS = 130
 
 
 # ============================================================
-# FILTROS DE QUALIDADE
+# FILTROS
 # ============================================================
 
-# Movimento mínimo para entrar no ranking
-MIN_30S = 0.30
-MIN_60S = 0.45
+# Movimento mínimo
+MIN_30S = 0.25
+MIN_60S = 0.35
 
-# Movimento máximo aceitável em 15s
-# Evita alguns spikes absurdos
+# Evita spikes absurdos
 MAX_15S = 5.0
 
-# Score mínimo para permitir alerta
-SCORE_MINIMO = 55
+# Score mínimo
+SCORE_MINIMO = 45
 
 
 # ============================================================
-# CONTROLE DE ALERTAS
+# ALERTAS
 # ============================================================
 
-# No máximo 1 alerta por minuto
+# Máximo de 1 alerta por minuto
 INTERVALO_ALERTAS = 60
 
-# A mesma moeda só pode voltar depois deste período
+# Mesma moeda só pode voltar depois de 8 minutos
 COOLDOWN_MOEDA = 8 * 60
+
+
+# ============================================================
+# EMA
+# ============================================================
+
+EMA_RAPIDA = 9
+EMA_MEDIA = 21
+EMA_LENTA = 50
+
+# Precisamos de candles suficientes
+MIN_CANDLES_EMA = 50
 
 
 # ============================================================
@@ -63,6 +75,11 @@ app = Flask(__name__)
 
 historico = defaultdict(
     lambda: deque(maxlen=150)
+)
+
+# Candles de 1 minuto
+candles_1m = defaultdict(
+    lambda: deque(maxlen=100)
 )
 
 contratos = []
@@ -76,6 +93,8 @@ ultimo_alerta_moeda = {}
 melhor_candidato = None
 
 rodando = True
+
+ultima_coleta_candle = 0
 
 
 # ============================================================
@@ -126,7 +145,7 @@ def enviar(mensagem):
     except Exception as e:
 
         print(
-            "Erro enviando Telegram:",
+            "Erro Telegram:",
             e
         )
 
@@ -134,7 +153,7 @@ def enviar(mensagem):
 
 
 # ============================================================
-# CONTRATOS FUTURES
+# CONTRATOS
 # ============================================================
 
 def carregar_contratos():
@@ -183,7 +202,6 @@ def carregar_contratos():
                 "state"
             )
 
-            # Apenas USDT perpétuo ativo
             if quote != "USDT":
                 continue
 
@@ -206,7 +224,7 @@ def carregar_contratos():
 
         print(
             f"[CONTRATOS] "
-            f"{len(contratos)} encontrados."
+            f"{len(contratos)} contratos."
         )
 
         return contratos
@@ -214,7 +232,7 @@ def carregar_contratos():
     except Exception as e:
 
         print(
-            "Erro carregando contratos:",
+            "Erro contratos:",
             e
         )
 
@@ -254,6 +272,7 @@ def obter_tickers():
             resultado,
             list
         ):
+
             return resultado
 
         if isinstance(
@@ -274,7 +293,7 @@ def obter_tickers():
     except Exception as e:
 
         print(
-            "Erro obtendo tickers:",
+            "Erro ticker:",
             e
         )
 
@@ -282,7 +301,7 @@ def obter_tickers():
 
 
 # ============================================================
-# SELEÇÃO DOS CONTRATOS
+# SELEÇÃO DOS CONTRATOS MAIS ATIVOS
 # ============================================================
 
 def selecionar_contratos():
@@ -338,7 +357,7 @@ def selecionar_contratos():
             if volume <= 0:
                 continue
 
-            # Evita moedas já completamente esticadas
+            # Evita extremos
             if variacao < -30:
                 continue
 
@@ -391,26 +410,24 @@ def selecionar_contratos():
 
 
 # ============================================================
-# HISTÓRICO
+# HISTÓRICO DE TICKS
 # ============================================================
 
 def salvar_preco(
     symbol,
     preco,
     volume,
-    hold_vol
+    hold
 ):
-
-    agora = time.time()
 
     historico[
         symbol
     ].append(
         {
-            "time": agora,
+            "time": time.time(),
             "price": preco,
             "volume": volume,
-            "hold": hold_vol
+            "hold": hold
         }
     )
 
@@ -433,7 +450,8 @@ def preco_anterior(
 
     alvo = (
         time.time()
-        - segundos
+        -
+        segundos
     )
 
     melhor = None
@@ -494,6 +512,295 @@ def variacao(
 
 
 # ============================================================
+# CRIAR CANDLE DE 1 MINUTO
+# ============================================================
+
+def atualizar_candle_1m():
+
+    agora = int(
+        time.time()
+    )
+
+    minuto = (
+        agora // 60
+    ) * 60
+
+    for symbol in list(
+        historico.keys()
+    ):
+
+        dados = historico[
+            symbol
+        ]
+
+        if not dados:
+            continue
+
+        preco = dados[-1][
+            "price"
+        ]
+
+        # Se não existe candle atual
+        if (
+            not candles_1m[symbol]
+            or
+            candles_1m[symbol][-1][
+                "time"
+            ]
+            != minuto
+        ):
+
+            candles_1m[
+                symbol
+            ].append(
+                {
+                    "time": minuto,
+                    "close": preco
+                }
+            )
+
+        else:
+
+            # Atualiza fechamento do minuto
+            candles_1m[
+                symbol
+            ][-1][
+                "close"
+            ] = preco
+
+
+# ============================================================
+# EMA
+# ============================================================
+
+def calcular_ema(
+    valores,
+    periodo
+):
+
+    if len(valores) < periodo:
+
+        return None
+
+    multiplicador = (
+        2 /
+        (periodo + 1)
+    )
+
+    ema = sum(
+        valores[
+            :periodo
+        ]
+    ) / periodo
+
+    for preco in valores[
+        periodo:
+    ]:
+
+        ema = (
+            (
+                preco - ema
+            )
+            *
+            multiplicador
+        ) + ema
+
+    return ema
+
+
+# ============================================================
+# PEGAR EMAS
+# ============================================================
+
+def obter_emas(
+    symbol
+):
+
+    candles = candles_1m.get(
+        symbol
+    )
+
+    if not candles:
+        return None
+
+    fechamentos = [
+        c["close"]
+        for c in candles
+    ]
+
+    if len(fechamentos) < MIN_CANDLES_EMA:
+
+        return None
+
+    ema9 = calcular_ema(
+        fechamentos,
+        EMA_RAPIDA
+    )
+
+    ema21 = calcular_ema(
+        fechamentos,
+        EMA_MEDIA
+    )
+
+    ema50 = calcular_ema(
+        fechamentos,
+        EMA_LENTA
+    )
+
+    if (
+        ema9 is None
+        or
+        ema21 is None
+        or
+        ema50 is None
+    ):
+
+        return None
+
+    return {
+        "ema9": ema9,
+        "ema21": ema21,
+        "ema50": ema50
+    }
+
+
+# ============================================================
+# PRÉ-CARREGAR EMAS DA MEXC
+# ============================================================
+
+def carregar_ema_historica():
+
+    print(
+        "[EMA] "
+        "Carregando histórico inicial..."
+    )
+
+    # Fazemos em lotes pequenos para
+    # respeitar o limite da API.
+    lista = contratos[
+        :MAX_CONTRATOS
+    ]
+
+    for i in range(
+        0,
+        len(lista),
+        10
+    ):
+
+        lote = lista[
+            i:i + 10
+        ]
+
+        for symbol in lote:
+
+            try:
+
+                url = (
+                    f"{MEXC_BASE}"
+                    f"/api/v1/contract/kline/"
+                    f"{symbol}"
+                )
+
+                parametros = {
+                    "interval": "Min1"
+                }
+
+                resposta = requests.get(
+                    url,
+                    params=parametros,
+                    timeout=15
+                )
+
+                if resposta.status_code != 200:
+
+                    continue
+
+                dados = resposta.json()
+
+                data = dados.get(
+                    "data"
+                )
+
+                if not data:
+
+                    continue
+
+                tempos = data.get(
+                    "time",
+                    []
+                )
+
+                fechamentos = data.get(
+                    "close",
+                    []
+                )
+
+                if not fechamentos:
+
+                    continue
+
+                # Últimos 100 candles
+                inicio = max(
+                    0,
+                    len(fechamentos) - 100
+                )
+
+                for j in range(
+                    inicio,
+                    len(fechamentos)
+                ):
+
+                    candles_1m[
+                        symbol
+                    ].append(
+                        {
+                            "time": int(
+                                tempos[j]
+                            ),
+                            "close": float(
+                                fechamentos[j]
+                            )
+                        }
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"[EMA] "
+                    f"Erro {symbol}: {e}"
+                )
+
+        # Pequena pausa
+        time.sleep(
+            0.7
+        )
+
+    print(
+        "[EMA] "
+        "Histórico carregado."
+    )
+
+
+# ============================================================
+# BTC
+# ============================================================
+
+def obter_btc_variacoes():
+
+    v30 = variacao(
+        "BTC_USDT",
+        30
+    )
+
+    v60 = variacao(
+        "BTC_USDT",
+        60
+    )
+
+    return v30, v60
+
+
+# ============================================================
 # SCORE
 # ============================================================
 
@@ -525,9 +832,9 @@ def calcular_score(
     if v60 is None:
         return None
 
-    # ----------------------------------------
-    # FILTROS
-    # ----------------------------------------
+    # ----------------------------
+    # Filtros básicos
+    # ----------------------------
 
     if v30 < MIN_30S:
         return None
@@ -541,31 +848,143 @@ def calcular_score(
     if v15 > MAX_15S:
         return None
 
-    # ----------------------------------------
-    # SCORE DE PREÇO
-    # ----------------------------------------
+    # ----------------------------
+    # BTC
+    # ----------------------------
+
+    btc30, btc60 = (
+        obter_btc_variacoes()
+    )
+
+    if btc30 is None:
+        btc30 = 0
+
+    if btc60 is None:
+        btc60 = 0
+
+    # ----------------------------
+    # Força relativa
+    # ----------------------------
+
+    forca30 = (
+        v30 - btc30
+    )
+
+    forca60 = (
+        v60 - btc60
+    )
+
+    # ----------------------------
+    # EMAs
+    # ----------------------------
+
+    emas = obter_emas(
+        symbol
+    )
+
+    if emas is None:
+
+        # Sem histórico suficiente:
+        # ainda pode participar,
+        # mas perde pontos.
+        ema_bonus = 0
+        tendencia = "SEM_HIST"
+
+    else:
+
+        ema9 = emas["ema9"]
+        ema21 = emas["ema21"]
+        ema50 = emas["ema50"]
+
+        ema_bonus = 0
+
+        # EMA 9 acima da 21
+        if ema9 > ema21:
+
+            ema_bonus += 10
+
+        # EMA 21 acima da 50
+        if ema21 > ema50:
+
+            ema_bonus += 8
+
+        # Alinhamento completo
+        if (
+            ema9 > ema21
+            and
+            ema21 > ema50
+        ):
+
+            ema_bonus += 7
+
+        # Preço acima da EMA 9
+        dados = historico[
+            symbol
+        ]
+
+        if dados:
+
+            preco = dados[-1][
+                "price"
+            ]
+
+            if preco > ema9:
+
+                ema_bonus += 5
+
+        tendencia = "ALTA" if (
+            ema9 > ema21
+            and
+            ema21 > ema50
+        ) else "MISTA"
+
+    # ----------------------------
+    # Score do preço
+    # ----------------------------
 
     score_15 = min(
         v15 / 0.50,
         1
-    ) * 25
+    ) * 15
 
     score_30 = min(
         v30 / 1.00,
         1
-    ) * 30
+    ) * 25
 
     score_60 = min(
         v60 / 1.50,
         1
-    ) * 25
+    ) * 20
 
-    # ----------------------------------------
-    # ACELERAÇÃO
-    # ----------------------------------------
+    # ----------------------------
+    # Força relativa
+    # ----------------------------
+
+    score_forca30 = min(
+        max(
+            forca30,
+            0
+        ) / 0.80,
+        1
+    ) * 10
+
+    score_forca60 = min(
+        max(
+            forca60,
+            0
+        ) / 1.20,
+        1
+    ) * 10
+
+    # ----------------------------
+    # Aceleração
+    # ----------------------------
 
     aceleracao = (
-        v30 - v60 / 2
+        v30
+        -
+        (v60 / 2)
     )
 
     score_aceleracao = min(
@@ -576,22 +995,9 @@ def calcular_score(
         1
     ) * 10
 
-    # ----------------------------------------
-    # CONSISTÊNCIA
-    # ----------------------------------------
-
-    consistencia = 0
-
-    if v15 > 0:
-        consistencia += 3
-
-    if v30 > v15 * 0.8:
-        consistencia += 3
-
-    if v60 > v30:
-        consistencia += 4
-
-    score_consistencia = consistencia
+    # ----------------------------
+    # SCORE FINAL
+    # ----------------------------
 
     score = (
         score_15
@@ -600,9 +1006,13 @@ def calcular_score(
         +
         score_60
         +
+        score_forca30
+        +
+        score_forca60
+        +
         score_aceleracao
         +
-        score_consistencia
+        ema_bonus
     )
 
     return {
@@ -612,7 +1022,13 @@ def calcular_score(
         ),
         "v15": v15,
         "v30": v30,
-        "v60": v60
+        "v60": v60,
+        "btc30": btc30,
+        "btc60": btc60,
+        "forca30": forca30,
+        "forca60": forca60,
+        "ema_bonus": ema_bonus,
+        "tendencia": tendencia
     }
 
 
@@ -631,6 +1047,7 @@ def analisar_candidato(
     )
 
     if resultado is None:
+
         return
 
     score = resultado[
@@ -638,11 +1055,12 @@ def analisar_candidato(
     ]
 
     if score < SCORE_MINIMO:
+
         return
 
     agora = time.time()
 
-    # Cooldown individual
+    # Cooldown da moeda
     ultimo = ultimo_alerta_moeda.get(
         symbol,
         0
@@ -661,23 +1079,44 @@ def analisar_candidato(
     ]
 
     if not dados:
+
         return
 
     atual = dados[-1]
 
     candidato = {
+
         "symbol": symbol,
+
         "score": score,
+
         "v15": resultado["v15"],
+
         "v30": resultado["v30"],
+
         "v60": resultado["v60"],
+
+        "btc30": resultado["btc30"],
+
+        "btc60": resultado["btc60"],
+
+        "forca30": resultado["forca30"],
+
+        "forca60": resultado["forca60"],
+
+        "ema_bonus": resultado["ema_bonus"],
+
+        "tendencia": resultado["tendencia"],
+
         "price": atual["price"],
+
         "volume": atual["volume"],
+
         "hold": atual["hold"],
+
         "time": agora
     }
 
-    # Guarda somente o melhor
     if (
         melhor_candidato is None
         or
@@ -692,8 +1131,8 @@ def analisar_candidato(
             f"[MELHOR] "
             f"{symbol} "
             f"score={score:.1f} "
-            f"30s={resultado['v30']:.2f}% "
-            f"60s={resultado['v60']:.2f}%"
+            f"EMA={resultado['tendencia']} "
+            f"BTC30={resultado['btc30']:.2f}%"
         )
 
 
@@ -746,16 +1185,28 @@ def formatar_volume(
 
 
 # ============================================================
-# CLASSIFICAÇÃO
+# NÍVEL DO ALERTA
 # ============================================================
 
 def nivel_alerta(
     candidato
 ):
 
-    v30 = candidato["v30"]
-    v60 = candidato["v60"]
-    score = candidato["score"]
+    score = candidato[
+        "score"
+    ]
+
+    v30 = candidato[
+        "v30"
+    ]
+
+    v60 = candidato[
+        "v60"
+    ]
+
+    tendencia = candidato[
+        "tendencia"
+    ]
 
     if (
         score >= 85
@@ -763,6 +1214,8 @@ def nivel_alerta(
         v30 >= 0.80
         and
         v60 >= 1.00
+        and
+        tendencia == "ALTA"
     ):
 
         return (
@@ -790,7 +1243,7 @@ def nivel_alerta(
 
 
 # ============================================================
-# ENVIAR O MELHOR ALERTA
+# ENVIAR MELHOR
 # ============================================================
 
 def enviar_melhor_alerta():
@@ -804,7 +1257,6 @@ def enviar_melhor_alerta():
 
     agora = time.time()
 
-    # Nunca mais de 1 por minuto
     if (
         agora - ultimo_alerta_global
         <
@@ -815,7 +1267,6 @@ def enviar_melhor_alerta():
 
     candidato = melhor_candidato
 
-    # Limpa antes do envio
     melhor_candidato = None
 
     symbol = candidato[
@@ -838,6 +1289,30 @@ def enviar_melhor_alerta():
         "v60"
     ]
 
+    btc30 = candidato[
+        "btc30"
+    ]
+
+    btc60 = candidato[
+        "btc60"
+    ]
+
+    forca30 = candidato[
+        "forca30"
+    ]
+
+    forca60 = candidato[
+        "forca60"
+    ]
+
+    ema_bonus = candidato[
+        "ema_bonus"
+    ]
+
+    tendencia = candidato[
+        "tendencia"
+    ]
+
     preco = candidato[
         "price"
     ]
@@ -854,8 +1329,28 @@ def enviar_melhor_alerta():
         candidato
     )
 
+    if tendencia == "ALTA":
+
+        tendencia_texto = (
+            "🟢 EMA 9 > EMA 21 > EMA 50"
+        )
+
+    elif tendencia == "MISTA":
+
+        tendencia_texto = (
+            "🟡 EMAs em tendência mista"
+        )
+
+    else:
+
+        tendencia_texto = (
+            "⚪ Histórico de EMA insuficiente"
+        )
+
     mensagem = (
-        f"{emoji} <b>{titulo}</b>\n\n"
+
+        f"{emoji} "
+        f"<b>{titulo}</b>\n\n"
 
         f"🚀 <b>{symbol}</b>\n"
 
@@ -874,6 +1369,24 @@ def enviar_melhor_alerta():
         f"⚡ 60s: "
         f"<b>+{v60:.2f}%</b>\n\n"
 
+        f"₿ BTC 30s: "
+        f"<b>{btc30:+.2f}%</b>\n"
+
+        f"₿ BTC 60s: "
+        f"<b>{btc60:+.2f}%</b>\n"
+
+        f"💪 Força vs BTC 30s: "
+        f"<b>{forca30:+.2f}%</b>\n"
+
+        f"💪 Força vs BTC 60s: "
+        f"<b>{forca60:+.2f}%</b>\n\n"
+
+        f"📈 Tendência: "
+        f"<b>{tendencia_texto}</b>\n"
+
+        f"➕ Bônus EMA: "
+        f"<b>+{ema_bonus:.0f}</b>\n\n"
+
         f"📊 Volume 24h: "
         f"<b>{formatar_volume(volume)}</b>\n"
 
@@ -883,9 +1396,9 @@ def enviar_melhor_alerta():
         f"🏆 <b>Melhor sinal "
         f"detectado no último minuto.</b>\n\n"
 
-        f"⚠️ <i>O score mede força do "
-        f"movimento observado; não prevê "
-        f"que o preço continuará subindo.</i>"
+        f"⚠️ <i>O score mede a força "
+        f"observada. Não garante continuação "
+        f"do movimento.</i>"
     )
 
     if enviar(mensagem):
@@ -897,7 +1410,7 @@ def enviar_melhor_alerta():
         ] = agora
 
         print(
-            f"[ALERTA ENVIADO] "
+            f"[ALERTA] "
             f"{symbol} "
             f"score={score:.1f}"
         )
@@ -914,7 +1427,7 @@ def verificar():
     agora = time.time()
 
     # ----------------------------------------
-    # Atualizar contratos
+    # Contratos
     # ----------------------------------------
 
     if (
@@ -998,49 +1511,78 @@ def verificar():
         except Exception as e:
 
             print(
-                f"Erro {symbol}:",
-                e
+                f"Erro {symbol}: {e}"
             )
 
 
 # ============================================================
-# LOOP DO BOT
+# LOOP
 # ============================================================
 
 def loop_bot():
 
     global melhor_candidato
+    global ultima_coleta_candle
 
     print("=" * 60)
 
     print(
         "MEXC FUTURES "
-        "PUMP HUNTER - RANKING"
+        "PUMP HUNTER"
+    )
+
+    print(
+        "EMA + BTC + FORÇA RELATIVA"
     )
 
     print("=" * 60)
 
     enviar(
+
         "🚀 <b>MEXC FUTURES "
         "PUMP HUNTER</b>\n\n"
 
-        "🎯 Monitorando perpétuos USDT\n"
+        "🎯 Perpétuos USDT\n"
 
         "🔎 Até 100 contratos\n"
 
-        "📊 Ranking de força 0-100\n"
+        "📈 EMA 9 / 21 / 50\n"
 
-        "⚡ Análise 15s / 30s / 60s\n\n"
+        "₿ Filtro de tendência BTC\n"
 
-        "🏆 Enviando somente o "
-        "<b>melhor sinal por minuto</b>."
+        "💪 Força relativa\n"
+
+        "🏆 Ranking automático\n\n"
+
+        "⏱️ Máximo de "
+        "<b>1 alerta por minuto</b>."
     )
+
+    # ----------------------------------------
+    # Carrega contratos primeiro
+    # ----------------------------------------
+
+    carregar_contratos()
+
+    selecionar_contratos()
+
+    # ----------------------------------------
+    # Histórico das EMAs
+    # ----------------------------------------
+
+    carregar_ema_historica()
+
+    # ----------------------------------------
+    # Loop
+    # ----------------------------------------
 
     proximo_minuto = (
         time.time()
         +
         60
     )
+
+    ultimo_candle = 0
 
     while rodando:
 
@@ -1050,15 +1592,27 @@ def loop_bot():
 
             verificar()
 
+            # Atualiza candles 1m
+            agora = time.time()
+
+            if (
+                agora - ultimo_candle
+                >= 5
+            ):
+
+                atualizar_candle_1m()
+
+                ultimo_candle = agora
+
         except Exception as e:
 
             print(
-                "Erro:",
+                "Erro loop:",
                 e
             )
 
         # ------------------------------------
-        # A cada minuto escolhe o melhor
+        # Fecha o minuto e escolhe o melhor
         # ------------------------------------
 
         agora = time.time()
@@ -1097,12 +1651,15 @@ def loop_bot():
 def home():
 
     return """
+
     <html>
 
     <head>
+
         <title>
             MEXC Futures Pump Hunter
         </title>
+
     </head>
 
     <body>
@@ -1116,20 +1673,25 @@ def home():
         </p>
 
         <p>
-            Monitorando perpétuos USDT.
+            Perpétuos USDT.
         </p>
 
         <p>
-            Ranking de sinais ativo.
+            EMA 9 / 21 / 50.
         </p>
 
         <p>
-            Máximo: 1 alerta por minuto.
+            Filtro BTC + força relativa.
+        </p>
+
+        <p>
+            Máximo de 1 alerta por minuto.
         </p>
 
     </body>
 
     </html>
+
     """
 
 
@@ -1137,28 +1699,46 @@ def home():
 def status():
 
     return {
+
         "status": "online",
-        "contratos_monitorados": len(
-            contratos
-        ),
-        "historicos": len(
-            historico
-        ),
-        "ultimo_alerta": (
-            ultimo_alerta_global
-        ),
-        "melhor_candidato": (
-            melhor_candidato[
-                "symbol"
-            ]
-            if melhor_candidato
-            else None
-        )
+
+        "contratos_monitorados":
+            len(contratos),
+
+        "historicos":
+            len(historico),
+
+        "candles_1m":
+            len(candles_1m),
+
+        "ultimo_alerta":
+            ultimo_alerta_global,
+
+        "melhor_candidato":
+            (
+                melhor_candidato[
+                    "symbol"
+                ]
+                if melhor_candidato
+                else None
+            ),
+
+        "score_melhor":
+            (
+                round(
+                    melhor_candidato[
+                        "score"
+                    ],
+                    1
+                )
+                if melhor_candidato
+                else None
+            )
     }
 
 
 # ============================================================
-# INICIALIZAÇÃO
+# INICIAR
 # ============================================================
 
 if __name__ == "__main__":
