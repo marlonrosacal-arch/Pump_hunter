@@ -1,100 +1,175 @@
 import os
 import time
+import signal
 import threading
+import traceback
 from collections import defaultdict, deque
 
 import requests
 from flask import Flask, jsonify
 
 
-# =========================================================
+# ============================================================
 # CONFIGURAÇÕES
-# =========================================================
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# NOVO domínio oficial da API Futures da MEXC
 MEXC_BASE = "https://api.mexc.com"
 
+# Intervalo principal
 INTERVALO_SCAN = 5
 
-# Quantidade máxima de contratos monitorados
-MAX_CONTRATOS = 100
+# Quantidade máxima de contratos acompanhados
+MAX_CONTRATOS = 50
 
-# Máximo de 1 alerta por minuto
+# Máximo de alertas
 ALERTA_INTERVALO = 60
 
-# Cooldown individual da moeda
+# Depois de alertar uma moeda, espera este tempo
 COOLDOWN_MOEDA = 8 * 60
 
-# =========================================================
-# FILTRO PRINCIPAL
-# =========================================================
+# ============================================================
+# FILTROS
+# ============================================================
 
-# Pump confirmado:
+# Principal requisito:
+# +5% ou mais nos últimos 60 segundos
 PUMP_60S = 5.0
 
-# Para detectar aceleração antes dos 5%
-ACELERACAO_15S = 0.40
-ACELERACAO_30S = 0.70
-
-# Score mínimo para alerta normal
-SCORE_MINIMO = 50
+# Movimentos antecipados
+MIN_15S = 0.35
+MIN_30S = 0.60
+MIN_60S = 0.80
 
 # Score mínimo para alerta antecipado
-SCORE_ANTECIPADO = 60
+SCORE_MINIMO = 55
 
+# Score especial para movimentos muito fortes
+SCORE_FORTE = 70
 
-# =========================================================
-# FLASK
-# =========================================================
+# BTC
+BTC_MAX_QUEDA_15S = -0.45
+BTC_MAX_QUEDA_60S = -1.00
+
+# Histórico
+HISTORICO_MAX = 100
+
+# Timeout das APIs
+HTTP_TIMEOUT = 8
+
+# ============================================================
+# ESTADO
+# ============================================================
 
 app = Flask(__name__)
 
-inicio_bot = time.time()
-ultimo_alerta = 0
+session = requests.Session()
+
+historico = defaultdict(lambda: deque(maxlen=HISTORICO_MAX))
+
+ultimo_alerta_global = 0
 ultimo_alerta_moeda = {}
 
-stats = {
+contratos_monitorados = []
+
+rodando = True
+
+estado = {
+    "inicio": time.time(),
+    "ultimo_scan": None,
+    "ultimo_sucesso_mexc": None,
+    "ultimo_erro": None,
     "scans": 0,
     "erros": 0,
     "alertas": 0,
-    "candidatos": 0,
+    "contratos": 0,
 }
 
 
+# ============================================================
+# FLASK
+# ============================================================
+
 @app.route("/")
 def home():
-    return "🚀 PUMP RADAR V3 ONLINE"
+    return "Pump Hunter V4 ONLINE"
 
 
 @app.route("/status")
 def status():
+    agora = time.time()
+
+    ultimo_scan = estado["ultimo_scan"]
+
+    idade_scan = None
+    if ultimo_scan:
+        idade_scan = round(agora - ultimo_scan, 1)
+
     return jsonify({
         "status": "online",
-        "scans": stats["scans"],
-        "erros": stats["erros"],
-        "alertas": stats["alertas"],
-        "candidatos": stats["candidatos"],
-        "ultimo_alerta": ultimo_alerta,
-        "tempo_rodando_segundos": int(time.time() - inicio_bot)
+        "versao": "V4",
+        "uptime_segundos": round(agora - estado["inicio"]),
+        "ultimo_scan_segundos_atras": idade_scan,
+        "ultimo_sucesso_mexc": estado["ultimo_sucesso_mexc"],
+        "ultimo_erro": estado["ultimo_erro"],
+        "scans": estado["scans"],
+        "erros": estado["erros"],
+        "alertas": estado["alertas"],
+        "contratos_monitorados": estado["contratos"],
+        "ultima_alerta_global_segundos_atras": (
+            round(agora - ultimo_alerta_global, 1)
+            if ultimo_alerta_global
+            else None
+        )
     })
 
 
 def iniciar_servidor():
+    porta = int(os.environ.get("PORT", 10000))
+
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
+        port=porta,
+        threaded=True,
+        use_reloader=False
     )
 
 
-# =========================================================
+# ============================================================
+# HTTP
+# ============================================================
+
+def get_json(url, params=None, tentativas=3):
+    ultimo_erro = None
+
+    for tentativa in range(tentativas):
+        try:
+            resposta = session.get(
+                url,
+                params=params,
+                timeout=HTTP_TIMEOUT
+            )
+
+            resposta.raise_for_status()
+
+            return resposta.json()
+
+        except Exception as e:
+            ultimo_erro = e
+
+            if tentativa < tentativas - 1:
+                time.sleep(0.7)
+
+    raise ultimo_erro
+
+
+# ============================================================
 # TELEGRAM
-# =========================================================
+# ============================================================
 
-def enviar_telegram(texto):
-
+def enviar_telegram(mensagem):
     if not BOT_TOKEN or not CHAT_ID:
         print("ERRO: BOT_TOKEN ou CHAT_ID não configurado.")
         return False
@@ -103,165 +178,137 @@ def enviar_telegram(texto):
 
     dados = {
         "chat_id": CHAT_ID,
-        "text": texto,
+        "text": mensagem,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
 
     try:
-        r = requests.post(
+        resposta = session.post(
             url,
-            json=dados,
-            timeout=10
+            data=dados,
+            timeout=HTTP_TIMEOUT
         )
 
-        if r.status_code != 200:
-            print("Erro Telegram:", r.status_code, r.text)
-            return False
-
-        return True
-
-    except Exception as e:
-        print("Erro enviando Telegram:", e)
-        return False
-
-
-# =========================================================
-# REQUEST MEXC
-# =========================================================
-
-def mexc_get(endpoint, params=None):
-
-    url = MEXC_BASE + endpoint
-
-    try:
-
-        r = requests.get(
-            url,
-            params=params,
-            timeout=10
-        )
-
-        if r.status_code != 200:
-            print(
-                f"ERRO MEXC {r.status_code}: "
-                f"{endpoint} | {r.text[:300]}"
-            )
-            stats["erros"] += 1
-            return None
-
-        data = r.json()
-
-        return data
-
-    except Exception as e:
+        if resposta.ok:
+            return True
 
         print(
-            f"ERRO REQUEST MEXC: "
-            f"{endpoint} | {e}"
+            "Erro Telegram:",
+            resposta.status_code,
+            resposta.text[:300]
         )
 
-        stats["erros"] += 1
+    except Exception as e:
+        print("Erro ao enviar Telegram:", e)
 
-        return None
+    return False
 
 
-# =========================================================
+# ============================================================
 # CONTRATOS
-# =========================================================
+# ============================================================
 
 def obter_contratos():
+    """
+    Busca os contratos Futures USDT disponíveis.
+    Depois filtra e ordena por liquidez/volume.
+    """
 
-    data = mexc_get(
-        "/api/v1/contract/detail"
-    )
+    url = f"{MEXC_BASE}/api/v1/contract/detail"
 
-    if not data:
+    try:
+        dados = get_json(url)
+
+        if not isinstance(dados, dict):
+            raise ValueError("Resposta inválida da MEXC")
+
+        lista = dados.get("data", [])
+
+        candidatos = []
+
+        for item in lista:
+
+            simbolo = item.get("symbol", "")
+
+            if not simbolo.endswith("USDT"):
+                continue
+
+            # Alguns contratos podem estar inativos
+            if item.get("state") not in (None, 0, 1, "0", "1"):
+                continue
+
+            candidatos.append(simbolo)
+
+        # Sempre garantir BTC
+        if "BTC_USDT" in candidatos:
+            candidatos.remove("BTC_USDT")
+            candidatos.insert(0, "BTC_USDT")
+
+        print(
+            f"Contratos Futures encontrados: {len(candidatos)}"
+        )
+
+        return candidatos
+
+    except Exception as e:
+        print("Erro ao obter contratos:", e)
+        estado["erros"] += 1
+        estado["ultimo_erro"] = str(e)
+
         return []
 
-    lista = data.get("data", [])
 
-    contratos = []
-
-    for item in lista:
-
-        try:
-
-            symbol = item.get("symbol", "")
-
-            quote = str(
-                item.get("quoteCoin", "")
-            ).upper()
-
-            settle = str(
-                item.get("settleCoin", "")
-            ).upper()
-
-            state = item.get("state", 0)
-
-            if (
-                symbol
-                and quote == "USDT"
-                and settle == "USDT"
-                and int(state) == 0
-            ):
-                contratos.append(symbol)
-
-        except Exception:
-            continue
-
-    return contratos
-
-
-# =========================================================
-# TICKER
-# =========================================================
+# ============================================================
+# TICKER FUTURES
+# ============================================================
 
 def obter_tickers():
+    """
+    A MEXC retorna os tickers Futures.
+    Uma única chamada traz os dados de vários contratos.
+    """
 
-    data = mexc_get(
-        "/api/v1/contract/ticker"
-    )
+    url = f"{MEXC_BASE}/api/v1/contract/ticker"
 
-    if not data:
-        return {}
+    dados = get_json(url)
 
-    lista = data.get("data", [])
+    if not isinstance(dados, dict):
+        raise ValueError("Ticker Futures inválido")
+
+    lista = dados.get("data", [])
 
     resultado = {}
 
     for item in lista:
 
+        simbolo = item.get("symbol")
+
+        if not simbolo:
+            continue
+
         try:
-
-            symbol = item.get("symbol")
-
-            if not symbol:
-                continue
-
-            preco = float(
-                item.get("lastPrice", 0)
-            )
+            preco = float(item.get("lastPrice", 0))
 
             if preco <= 0:
                 continue
 
-            resultado[symbol] = {
-                "price": preco,
+            volume = float(
+                item.get("amount24", 0)
+                or item.get("volume24", 0)
+                or 0
+            )
 
-                # Open interest / posição aberta
-                "holdVol": float(
-                    item.get("holdVol", 0) or 0
-                ),
+            oi = float(
+                item.get("holdVol", 0)
+                or 0
+            )
 
-                # Volume 24h
-                "volume24": float(
-                    item.get("volume24", 0) or 0
-                ),
-
-                "riseFallRate": float(
-                    item.get("riseFallRate", 0) or 0
-                ),
+            resultado[simbolo] = {
+                "preco": preco,
+                "volume": volume,
+                "oi": oi,
+                "timestamp": time.time()
             }
 
         except Exception:
@@ -270,507 +317,420 @@ def obter_tickers():
     return resultado
 
 
-# =========================================================
-# HISTÓRICO DE PREÇOS
-# =========================================================
+# ============================================================
+# HISTÓRICO
+# ============================================================
 
-historico = defaultdict(
-    lambda: deque(maxlen=90)
-)
-
-
-def registrar_precos(tickers):
+def atualizar_historico(tickers):
 
     agora = time.time()
 
-    for symbol, dados in tickers.items():
+    for simbolo in contratos_monitorados:
 
-        historico[symbol].append(
-            (
-                agora,
-                dados["price"],
-                dados["holdVol"],
-                dados["volume24"]
-            )
-        )
+        dados = tickers.get(simbolo)
+
+        if not dados:
+            continue
+
+        preco = dados["preco"]
+        volume = dados["volume"]
+        oi = dados["oi"]
+
+        historico[simbolo].append({
+            "t": agora,
+            "p": preco,
+            "v": volume,
+            "oi": oi
+        })
 
 
-# =========================================================
+# ============================================================
 # VARIAÇÃO
-# =========================================================
+# ============================================================
 
-def variacao(symbol, segundos):
+def variacao(hist, segundos):
 
-    dados = historico.get(symbol)
+    if not hist:
+        return 0.0
 
-    if not dados or len(dados) < 2:
-        return None
-
-    agora = time.time()
-
-    preco_atual = dados[-1][1]
+    agora = hist[-1]["t"]
+    preco_atual = hist[-1]["p"]
 
     alvo = agora - segundos
 
-    anterior = None
+    referencia = None
 
-    # Procuramos o preço mais próximo
-    # do período desejado
-    for item in dados:
+    # Procura o ponto mais próximo do tempo desejado
+    for item in reversed(hist):
 
-        if item[0] <= alvo:
-            anterior = item
-        else:
+        if item["t"] <= alvo:
+            referencia = item
             break
 
-    if anterior is None:
-        return None
+    if referencia is None:
+        return 0.0
 
-    preco_antigo = anterior[1]
+    preco_anterior = referencia["p"]
 
-    if preco_antigo <= 0:
-        return None
+    if preco_anterior <= 0:
+        return 0.0
 
-    return (
-        (preco_atual - preco_antigo)
-        / preco_antigo
-    ) * 100
+    return ((preco_atual / preco_anterior) - 1) * 100
 
 
-# =========================================================
+# ============================================================
 # EMA
-# =========================================================
+# ============================================================
 
-def calcular_ema(precos, periodo):
+def calcular_ema(valores, periodo):
 
-    if len(precos) < periodo:
+    if len(valores) < periodo:
         return None
 
-    multiplicador = 2 / (periodo + 1)
+    k = 2 / (periodo + 1)
 
-    ema = sum(precos[:periodo]) / periodo
+    ema = sum(valores[:periodo]) / periodo
 
-    for preco in precos[periodo:]:
+    for preco in valores[periodo:]:
         ema = (
-            (preco - ema)
-            * multiplicador
-        ) + ema
+            preco * k
+            + ema * (1 - k)
+        )
 
     return ema
 
 
-def obter_emas(symbol):
+def obter_emas(hist):
 
-    dados = historico.get(symbol)
+    if not hist:
+        return None, None, None
 
-    if not dados or len(dados) < 25:
-        return None
+    precos = [x["p"] for x in hist]
 
-    precos = [
-        item[1]
-        for item in dados
-    ]
+    ema9 = calcular_ema(precos, 9)
+    ema21 = calcular_ema(precos, 21)
+    ema50 = calcular_ema(precos, 50)
 
-    ema9 = calcular_ema(
-        precos,
-        9
-    )
+    return ema9, ema21, ema50
 
-    ema21 = calcular_ema(
-        precos,
-        21
-    )
 
-    ema50 = calcular_ema(
-        precos,
-        50
-    )
+# ============================================================
+# CONTEXTO BTC
+# ============================================================
 
-    if not ema9 or not ema21:
-        return None
+def obter_contexto_btc(tickers):
+
+    btc_hist = historico.get("BTC_USDT")
+
+    if not btc_hist or len(btc_hist) < 3:
+        return {
+            "r15": 0,
+            "r30": 0,
+            "r60": 0,
+            "preco": 0
+        }
 
     return {
-        "ema9": ema9,
-        "ema21": ema21,
-        "ema50": ema50
+        "r15": variacao(btc_hist, 15),
+        "r30": variacao(btc_hist, 30),
+        "r60": variacao(btc_hist, 60),
+        "preco": btc_hist[-1]["p"]
     }
 
 
-# =========================================================
-# BTC
-# =========================================================
+# ============================================================
+# FORÇA RELATIVA
+# ============================================================
 
-def obter_contexto_btc():
+def forca_relativa(m15, m30, m60, btc):
 
-    v15 = variacao(
-        "BTCUSDT",
-        15
-    )
-
-    v30 = variacao(
-        "BTCUSDT",
-        30
-    )
-
-    v60 = variacao(
-        "BTCUSDT",
-        60
-    )
+    rel15 = m15 - btc["r15"]
+    rel30 = m30 - btc["r30"]
+    rel60 = m60 - btc["r60"]
 
     return (
-        v15 or 0,
-        v30 or 0,
-        v60 or 0
+        rel15 * 0.30
+        + rel30 * 0.30
+        + rel60 * 0.40
     )
 
 
-# =========================================================
-# FORÇA RELATIVA
-# =========================================================
-
-def forca_relativa(
-    movimento_moeda,
-    movimento_btc
-):
-
-    return movimento_moeda - movimento_btc
-
-
-# =========================================================
+# ============================================================
 # SCORE
-# =========================================================
+# ============================================================
 
 def calcular_score(
-    symbol,
-    v15,
-    v30,
-    v60,
-    btc15,
-    btc30,
-    btc60,
-    tickers
+    m15,
+    m30,
+    m60,
+    btc,
+    ema9,
+    ema21,
+    ema50,
+    oi_atual,
+    oi_anterior
 ):
 
     score = 0
 
-    motivos = []
+    # --------------------------------------------------------
+    # MOVIMENTO
+    # --------------------------------------------------------
 
-    # -----------------------------------------------------
-    # 1. PUMP DE 60 SEGUNDOS
-    # -----------------------------------------------------
-
-    if v60 >= 5.0:
-
-        score += 35
-
-        motivos.append(
-            f"🚨 PUMP 60s +{v60:.2f}%"
-        )
-
-    elif v60 >= 3.0:
-
-        score += 25
-
-        motivos.append(
-            f"🔥 60s +{v60:.2f}%"
-        )
-
-    elif v60 >= 2.0:
-
-        score += 18
-
-        motivos.append(
-            f"⚡ 60s +{v60:.2f}%"
-        )
-
-    elif v60 >= 1.0:
-
-        score += 10
-
-    # -----------------------------------------------------
-    # 2. ACELERAÇÃO 30s
-    # -----------------------------------------------------
-
-    if v30 >= 2.0:
-
+    if m15 >= 0.35:
         score += 15
 
-        motivos.append(
-            f"🚀 30s +{v30:.2f}%"
-        )
+    if m15 >= 0.60:
+        score += 8
 
-    elif v30 >= 1.0:
+    if m15 >= 1.0:
+        score += 7
 
+    if m30 >= 0.60:
+        score += 12
+
+    if m30 >= 1.0:
+        score += 8
+
+    if m60 >= 0.80:
         score += 10
 
-    elif v30 >= 0.5:
+    if m60 >= 2.0:
+        score += 10
 
-        score += 5
-
-    # -----------------------------------------------------
-    # 3. MOVIMENTO 15s
-    # -----------------------------------------------------
-
-    if v15 >= 1.0:
-
+    if m60 >= 5.0:
         score += 15
 
-        motivos.append(
-            f"⚡ 15s +{v15:.2f}%"
-        )
+    # --------------------------------------------------------
+    # ACELERAÇÃO
+    # --------------------------------------------------------
 
-    elif v15 >= 0.5:
+    aceleracao = (
+        (m15 * 0.55)
+        + (m30 * 0.30)
+        + (m60 * 0.15)
+    )
 
-        score += 10
-
-    elif v15 >= 0.25:
-
+    if aceleracao >= 0.40:
         score += 5
 
-    # -----------------------------------------------------
-    # 4. FORÇA CONTRA BTC
-    # -----------------------------------------------------
+    if aceleracao >= 0.80:
+        score += 5
 
-    rel30 = forca_relativa(
-        v30,
-        btc30
-    )
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
 
-    rel60 = forca_relativa(
-        v60,
-        btc60
-    )
+    if ema9 and ema21 and ema50:
 
-    if rel30 >= 1.0:
+        if ema9 > ema21:
+            score += 8
 
-        score += 10
+        if ema21 > ema50:
+            score += 7
 
-        motivos.append(
-            "💪 Forte vs BTC"
-        )
-
-    elif rel30 >= 0.5:
-
-        score += 6
-
-    elif rel30 >= 0.2:
-
-        score += 3
-
-    if rel60 >= 1.0:
-
-        score += 10
-
-    elif rel60 >= 0.5:
-
-        score += 6
-
-    # -----------------------------------------------------
-    # 5. EMA
-    # -----------------------------------------------------
-
-    emas = obter_emas(symbol)
-
-    if emas:
-
-        ema9 = emas["ema9"]
-        ema21 = emas["ema21"]
-        ema50 = emas["ema50"]
-
-        preco = tickers[symbol]["price"]
-
-        if preco > ema9 > ema21:
-
-            score += 10
-
-            motivos.append(
-                "📈 EMA 9 > 21"
-            )
-
-        elif preco > ema9:
-
+        if ema9 > ema21 > ema50:
             score += 5
 
-        if ema50:
+    # --------------------------------------------------------
+    # BTC
+    # --------------------------------------------------------
 
-            if ema9 > ema21 > ema50:
+    if btc["r15"] >= -0.10:
+        score += 4
 
-                score += 10
+    if btc["r30"] >= -0.20:
+        score += 4
 
-                motivos.append(
-                    "📈 EMA 9 > 21 > 50"
-                )
+    if btc["r60"] >= -0.40:
+        score += 4
 
-            elif ema9 > ema21:
+    # --------------------------------------------------------
+    # FORÇA RELATIVA
+    # --------------------------------------------------------
 
-                score += 5
+    rel = forca_relativa(
+        m15,
+        m30,
+        m60,
+        btc
+    )
 
-    # -----------------------------------------------------
-    # 6. OPEN INTEREST
-    # -----------------------------------------------------
+    if rel > 0.30:
+        score += 5
 
-    dados_hist = historico.get(symbol)
+    if rel > 0.70:
+        score += 5
 
-    if dados_hist and len(dados_hist) >= 2:
+    if rel > 1.50:
+        score += 5
 
-        oi_atual = dados_hist[-1][2]
-        oi_antigo = dados_hist[0][2]
+    # --------------------------------------------------------
+    # OPEN INTEREST
+    # --------------------------------------------------------
 
-        if oi_antigo > 0:
+    if oi_atual > 0 and oi_anterior > 0:
 
-            oi_change = (
-                (oi_atual - oi_antigo)
-                / oi_antigo
-            ) * 100
+        variacao_oi = (
+            (oi_atual / oi_anterior) - 1
+        ) * 100
 
-            if oi_change >= 5:
+        if variacao_oi > 0.5:
+            score += 3
 
-                score += 10
+        if variacao_oi > 2:
+            score += 5
 
-                motivos.append(
-                    f"📊 OI +{oi_change:.1f}%"
-                )
-
-            elif oi_change >= 2:
-
-                score += 5
-
-    return min(score, 100), motivos
+    return min(score, 100)
 
 
-# =========================================================
+# ============================================================
 # CLASSIFICAÇÃO
-# =========================================================
+# ============================================================
 
-def classificacao(score, v60):
+def classificar_alerta(m60, score):
 
-    if v60 >= PUMP_60S:
-
+    if m60 >= PUMP_60S:
         return "🔴 PUMP CONFIRMADO"
 
-    if score >= 75:
-
+    if score >= SCORE_FORTE or m60 >= 2.5:
         return "🟠 MOVIMENTO MUITO FORTE"
 
-    if score >= 60:
-
-        return "🟡 ACELERAÇÃO FORTE"
-
-    return "⚪ CANDIDATO"
+    return "🟡 ACELERAÇÃO FORTE"
 
 
-# =========================================================
-# SELEÇÃO DOS CANDIDATOS
-# =========================================================
+# ============================================================
+# CANDIDATOS
+# ============================================================
 
-def analisar(tickers):
+def analisar_mercado(tickers):
 
-    btc15, btc30, btc60 = obter_contexto_btc()
+    btc = obter_contexto_btc(tickers)
 
     candidatos = []
 
-    for symbol in list(tickers.keys()):
+    for simbolo in contratos_monitorados:
 
-        if symbol == "BTCUSDT":
+        if simbolo == "BTC_USDT":
             continue
 
-        try:
+        hist = historico.get(simbolo)
 
-            v15 = variacao(
-                symbol,
-                15
-            )
+        if not hist or len(hist) < 15:
+            continue
 
-            v30 = variacao(
-                symbol,
-                30
-            )
+        m15 = variacao(hist, 15)
+        m30 = variacao(hist, 30)
+        m60 = variacao(hist, 60)
 
-            v60 = variacao(
-                symbol,
-                60
-            )
+        # Não queremos moedas claramente caindo
+        if m15 < -0.30:
+            continue
 
-            if (
-                v15 is None
-                or v30 is None
-                or v60 is None
-            ):
-                continue
+        if m60 < -0.50:
+            continue
 
-            # -------------------------------------------------
-            # Só consideramos movimento de alta.
-            # -------------------------------------------------
+        # Não alertar enquanto BTC estiver em queda muito forte
+        if btc["r15"] <= BTC_MAX_QUEDA_15S:
+            continue
 
-            if v60 < 0 and v30 < 0 and v15 < 0:
-                continue
+        if btc["r60"] <= BTC_MAX_QUEDA_60S:
+            continue
 
-            # -------------------------------------------------
-            # SCORE
-            # -------------------------------------------------
+        ema9, ema21, ema50 = obter_emas(hist)
 
-            score, motivos = calcular_score(
-                symbol,
-                v15,
-                v30,
-                v60,
-                btc15,
-                btc30,
-                btc60,
-                tickers
-            )
+        oi_atual = hist[-1]["oi"]
 
-            # -------------------------------------------------
-            # FILTRO ESPECIAL:
-            # +5% nos últimos 60 segundos
-            # sempre vira candidato.
-            # -------------------------------------------------
+        oi_anterior = hist[0]["oi"]
 
-            pump_confirmado = (
-                v60 >= PUMP_60S
-            )
+        score = calcular_score(
+            m15,
+            m30,
+            m60,
+            btc,
+            ema9,
+            ema21,
+            ema50,
+            oi_atual,
+            oi_anterior
+        )
 
-            # -------------------------------------------------
-            # Candidatos antecipados
-            # -------------------------------------------------
+        # ----------------------------------------------------
+        # REGRAS DE ENTRADA
+        # ----------------------------------------------------
 
-            acelerando = (
-                v15 >= ACELERACAO_15S
-                and v30 >= ACELERACAO_30S
-            )
+        pump_confirmado = m60 >= PUMP_60S
 
-            if (
-                pump_confirmado
-                or score >= SCORE_MINIMO
-                or acelerando
-            ):
+        aceleracao = (
+            m15 >= MIN_15S
+            and m30 >= MIN_30S
+            and m60 >= MIN_60S
+        )
 
-                candidatos.append({
-                    "symbol": symbol,
-                    "score": score,
-                    "v15": v15,
-                    "v30": v30,
-                    "v60": v60,
-                    "btc15": btc15,
-                    "btc30": btc30,
-                    "btc60": btc60,
-                    "motivos": motivos,
-                    "pump": pump_confirmado
-                })
+        movimento_forte = (
+            m15 >= 0.60
+            and m30 >= 1.0
+        )
 
-        except Exception as e:
+        if not (
+            pump_confirmado
+            or aceleracao
+            or movimento_forte
+        ):
+            continue
 
-            print(
-                f"Erro analisando {symbol}: {e}"
-            )
+        if not pump_confirmado and score < SCORE_MINIMO:
+            continue
+
+        # ----------------------------------------------------
+        # COOLDOWN
+        # ----------------------------------------------------
+
+        agora = time.time()
+
+        ultimo = ultimo_alerta_moeda.get(simbolo, 0)
+
+        if agora - ultimo < COOLDOWN_MOEDA:
+            continue
+
+        # ----------------------------------------------------
+        # FORÇA RELATIVA
+        # ----------------------------------------------------
+
+        rel = forca_relativa(
+            m15,
+            m30,
+            m60,
+            btc
+        )
+
+        candidatos.append({
+            "simbolo": simbolo,
+            "m15": m15,
+            "m30": m30,
+            "m60": m60,
+            "score": score,
+            "rel": rel,
+            "ema9": ema9,
+            "ema21": ema21,
+            "ema50": ema50,
+            "btc15": btc["r15"],
+            "btc60": btc["r60"],
+            "oi": oi_atual,
+            "pump": pump_confirmado
+        })
+
+    # --------------------------------------------------------
+    # ORDENAÇÃO
+    # --------------------------------------------------------
 
     candidatos.sort(
         key=lambda x: (
             x["pump"],
             x["score"],
-            x["v60"],
-            x["v30"],
-            x["v15"]
+            x["m60"],
+            x["m30"],
+            x["rel"]
         ),
         reverse=True
     )
@@ -778,321 +738,381 @@ def analisar(tickers):
     return candidatos
 
 
-# =========================================================
+# ============================================================
 # ALERTA
-# =========================================================
+# ============================================================
 
-def pode_alertar(candidato):
+def montar_alerta(c):
 
-    global ultimo_alerta
+    tipo = classificar_alerta(
+        c["m60"],
+        c["score"]
+    )
+
+    simbolo = c["simbolo"]
+
+    preco = 0
+
+    hist = historico.get(simbolo)
+
+    if hist:
+        preco = hist[-1]["p"]
+
+    mensagem = (
+        f"{tipo}\n\n"
+        f"<b>{simbolo}</b>\n"
+        f"Preço: <code>{preco:.8g}</code>\n\n"
+
+        f"⚡ 15s: <b>{c['m15']:+.2f}%</b>\n"
+        f"🚀 30s: <b>{c['m30']:+.2f}%</b>\n"
+        f"🔥 60s: <b>{c['m60']:+.2f}%</b>\n\n"
+
+        f"🏆 Score: <b>{c['score']}/100</b>\n"
+        f"💪 Força vs BTC: <b>{c['rel']:+.2f}</b>\n\n"
+
+        f"📊 BTC 15s: {c['btc15']:+.2f}%\n"
+        f"📊 BTC 60s: {c['btc60']:+.2f}%\n\n"
+    )
+
+    if c["ema9"] and c["ema21"] and c["ema50"]:
+
+        mensagem += (
+            f"EMA 9: {c['ema9']:.8g}\n"
+            f"EMA 21: {c['ema21']:.8g}\n"
+            f"EMA 50: {c['ema50']:.8g}\n\n"
+        )
+
+    mensagem += (
+        "⚠️ Radar de movimento — "
+        "não é garantia de continuação."
+    )
+
+    return mensagem
+
+
+def tentar_alertar(candidato):
+
+    global ultimo_alerta_global
 
     agora = time.time()
 
-    symbol = candidato["symbol"]
+    # --------------------------------------------------------
+    # LIMITE GLOBAL: 1 ALERTA/MINUTO
+    # --------------------------------------------------------
 
-    # -----------------------------------------------------
-    # Máximo 1 alerta por minuto
-    # -----------------------------------------------------
-
-    if (
-        agora - ultimo_alerta
-        < ALERTA_INTERVALO
-    ):
+    if agora - ultimo_alerta_global < ALERTA_INTERVALO:
         return False
 
-    # -----------------------------------------------------
-    # Cooldown da moeda
-    # -----------------------------------------------------
+    mensagem = montar_alerta(candidato)
 
-    ultimo_moeda = (
-        ultimo_alerta_moeda.get(
-            symbol,
-            0
-        )
+    sucesso = enviar_telegram(mensagem)
+
+    if not sucesso:
+        return False
+
+    simbolo = candidato["simbolo"]
+
+    ultimo_alerta_global = agora
+    ultimo_alerta_moeda[simbolo] = agora
+
+    estado["alertas"] += 1
+
+    print(
+        f"🚨 ALERTA ENVIADO | "
+        f"{simbolo} | "
+        f"score={candidato['score']} | "
+        f"60s={candidato['m60']:+.2f}%"
     )
-
-    if (
-        agora - ultimo_moeda
-        < COOLDOWN_MOEDA
-    ):
-        return False
 
     return True
 
 
-def enviar_alerta(candidato):
+# ============================================================
+# LOG
+# ============================================================
 
-    global ultimo_alerta
+def mostrar_resumo(candidatos):
 
-    symbol = candidato["symbol"]
+    if not candidatos:
+        print("Nenhum sinal qualificado neste ciclo.")
+        return
 
-    score = candidato["score"]
+    melhor = candidatos[0]
 
-    v15 = candidato["v15"]
-    v30 = candidato["v30"]
-    v60 = candidato["v60"]
-
-    btc15 = candidato["btc15"]
-    btc30 = candidato["btc30"]
-    btc60 = candidato["btc60"]
-
-    motivos = candidato["motivos"]
-
-    tipo = classificacao(
-        score,
-        v60
+    print(
+        "🏆 MELHOR CANDIDATO | "
+        f"{melhor['simbolo']} | "
+        f"score={melhor['score']} | "
+        f"15s={melhor['m15']:+.2f}% | "
+        f"30s={melhor['m30']:+.2f}% | "
+        f"60s={melhor['m60']:+.2f}%"
     )
 
-    texto = f"""
-{tipo}
 
-<b>{symbol}</b>
+# ============================================================
+# SELEÇÃO DE LIQUIDEZ
+# ============================================================
 
-🎯 Score: <b>{score}/100</b>
+def selecionar_contratos(tickers):
 
-📊 Movimento:
-15s: <b>{v15:+.2f}%</b>
-30s: <b>{v30:+.2f}%</b>
-60s: <b>{v60:+.2f}%</b>
+    candidatos = []
 
-₿ BTC:
-15s: {btc15:+.2f}%
-30s: {btc30:+.2f}%
-60s: {btc60:+.2f}%
+    for simbolo, dados in tickers.items():
 
-<b>Confirmações:</b>
-"""
+        if not simbolo.endswith("USDT"):
+            continue
 
-    if motivos:
+        if dados["preco"] <= 0:
+            continue
 
-        for motivo in motivos[:6]:
+        volume = dados["volume"]
 
-            texto += f"{motivo}\n"
-
-    else:
-
-        texto += "Movimento detectado.\n"
-
-    if v60 >= PUMP_60S:
-
-        texto += (
-            "\n🚨 <b>ATENÇÃO: "
-            f"+{v60:.2f}% EM 60 SEGUNDOS</b>"
+        candidatos.append(
+            (simbolo, volume)
         )
 
-    texto += (
-        "\n\n⏱️ Radar V3"
-        "\n⚠️ Sinal baseado em dados de mercado; "
-        "não é garantia de continuação do movimento."
+    candidatos.sort(
+        key=lambda x: x[1],
+        reverse=True
     )
 
-    sucesso = enviar_telegram(
-        texto
-    )
+    selecionados = [
+        x[0]
+        for x in candidatos[:MAX_CONTRATOS]
+    ]
 
-    if sucesso:
+    # BTC sempre presente
+    if "BTC_USDT" in tickers:
 
-        agora = time.time()
+        if "BTC_USDT" in selecionados:
+            selecionados.remove("BTC_USDT")
 
-        ultimo_alerta = agora
+        selecionados.insert(0, "BTC_USDT")
 
-        ultimo_alerta_moeda[
-            symbol
-        ] = agora
-
-        stats["alertas"] += 1
-
-        print(
-            f"🚨 ALERTA ENVIADO: "
-            f"{symbol} | "
-            f"Score {score} | "
-            f"60s {v60:+.2f}%"
-        )
-
-        return True
-
-    return False
+    return selecionados[:MAX_CONTRATOS]
 
 
-# =========================================================
+# ============================================================
 # LOOP PRINCIPAL
-# =========================================================
+# ============================================================
 
 def monitorar():
 
+    global contratos_monitorados
+
     print("=" * 60)
-    print("🚀 PUMP RADAR V3 INICIANDO")
+    print("🚀 PUMP HUNTER V4 INICIANDO")
     print("=" * 60)
 
     print(
-        f"Filtro pump confirmado: "
-        f"+{PUMP_60S:.1f}% / 60s"
+        f"Intervalo: {INTERVALO_SCAN}s"
     )
 
     print(
-        f"Máximo de alertas: "
-        f"1 por {ALERTA_INTERVALO}s"
+        f"Máximo contratos: {MAX_CONTRATOS}"
     )
 
     print(
-        f"Cooldown por moeda: "
-        f"{COOLDOWN_MOEDA // 60} minutos"
+        f"Pump confirmado: +{PUMP_60S}% / 60s"
     )
-
-    contratos = obter_contratos()
-
-    if not contratos:
-
-        print(
-            "❌ Não foi possível obter contratos."
-        )
-
-        return
 
     print(
-        f"Contratos Futures USDT encontrados: "
-        f"{len(contratos)}"
+        "Máximo alertas: 1/min"
     )
 
-    # Limitamos a quantidade inicial
-    contratos = contratos[:MAX_CONTRATOS]
+    print("=" * 60)
 
-    print(
-        f"Monitorando até "
-        f"{len(contratos)} contratos."
-    )
+    ultimo_refresh_contratos = 0
 
-    enviar_telegram(
-        "🚀 <b>PUMP RADAR V3 ONLINE</b>\n\n"
-        f"Monitorando até {len(contratos)} Futures USDT.\n"
-        f"🚨 Pump confirmado: +{PUMP_60S:.1f}% em 60s.\n"
-        "📊 Ranking por score.\n"
-        "⏱️ Máximo 1 alerta por minuto."
-    )
+    while rodando:
 
-    ultimo_log = 0
-
-    while True:
+        inicio_ciclo = time.time()
 
         try:
 
-            stats["scans"] += 1
+            # ------------------------------------------------
+            # REFRESH DE CONTRATOS
+            # ------------------------------------------------
+
+            if (
+                not contratos_monitorados
+                or time.time() - ultimo_refresh_contratos > 15 * 60
+            ):
+
+                contratos = obter_contratos()
+
+                if contratos:
+                    contratos_monitorados = contratos
+
+                ultimo_refresh_contratos = time.time()
+
+            # ------------------------------------------------
+            # TICKERS
+            # ------------------------------------------------
 
             tickers = obter_tickers()
 
-            if not tickers:
+            estado["ultimo_sucesso_mexc"] = time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
 
-                print(
-                    "⚠️ Nenhum ticker recebido."
-                )
+            # ------------------------------------------------
+            # SELEÇÃO POR LIQUIDEZ
+            # ------------------------------------------------
 
-                time.sleep(
-                    INTERVALO_SCAN
-                )
-
-                continue
-
-            # Somente contratos válidos
-            tickers = {
-                s: d
-                for s, d in tickers.items()
-                if s in contratos
-            }
-
-            registrar_precos(
+            selecionados = selecionar_contratos(
                 tickers
             )
 
-            # -------------------------------------------------
-            # Análise
-            # -------------------------------------------------
+            if selecionados:
 
-            candidatos = analisar(
+                contratos_monitorados = selecionados
+
+            estado["contratos"] = len(
+                contratos_monitorados
+            )
+
+            # ------------------------------------------------
+            # HISTÓRICO
+            # ------------------------------------------------
+
+            atualizar_historico(
                 tickers
             )
 
-            stats["candidatos"] = len(
+            # ------------------------------------------------
+            # ANÁLISE
+            # ------------------------------------------------
+
+            candidatos = analisar_mercado(
+                tickers
+            )
+
+            mostrar_resumo(
                 candidatos
             )
 
-            # -------------------------------------------------
-            # LOG RESUMIDO
-            # -------------------------------------------------
-
-            agora = time.time()
-
-            if (
-                agora - ultimo_log
-                >= 60
-            ):
-
-                ultimo_log = agora
-
-                print(
-                    f"\n📡 Monitoradas: "
-                    f"{len(tickers)}/{len(contratos)}"
-                )
-
-                if candidatos:
-
-                    print(
-                        "🏆 TOP CANDIDATOS:"
-                    )
-
-                    for c in candidatos[:5]:
-
-                        print(
-                            f"{c['symbol']} | "
-                            f"Score {c['score']} | "
-                            f"15s {c['v15']:+.2f}% | "
-                            f"30s {c['v30']:+.2f}% | "
-                            f"60s {c['v60']:+.2f}%"
-                        )
-
-                else:
-
-                    print(
-                        "Nenhum candidato forte "
-                        "neste minuto."
-                    )
-
-            # -------------------------------------------------
-            # Melhor candidato
-            # -------------------------------------------------
+            # ------------------------------------------------
+            # ALERTA
+            # ------------------------------------------------
 
             if candidatos:
 
-                melhor = candidatos[0]
+                tentar_alertar(
+                    candidatos[0]
+                )
 
-                if pode_alertar(
-                    melhor
-                ):
+            estado["scans"] += 1
+            estado["ultimo_scan"] = time.time()
 
-                    enviar_alerta(
-                        melhor
-                    )
+            # ------------------------------------------------
+            # LOG PERIÓDICO
+            # ------------------------------------------------
 
-            time.sleep(
-                INTERVALO_SCAN
-            )
+            if estado["scans"] % 12 == 0:
+
+                print(
+                    f"❤️ V4 ONLINE | "
+                    f"scans={estado['scans']} | "
+                    f"contratos={len(contratos_monitorados)} | "
+                    f"alertas={estado['alertas']} | "
+                    f"erros={estado['erros']}"
+                )
 
         except Exception as e:
 
-            stats["erros"] += 1
+            estado["erros"] += 1
+            estado["ultimo_erro"] = str(e)
+
+            print("=" * 60)
+            print("⚠️ ERRO NO CICLO")
+            print(str(e))
+            print("=" * 60)
+
+            traceback.print_exc()
+
+            # Nunca deixar uma exceção matar o monitor
+            time.sleep(3)
+
+        # ----------------------------------------------------
+        # CONTROLE DO INTERVALO
+        # ----------------------------------------------------
+
+        duracao = time.time() - inicio_ciclo
+
+        espera = max(
+            1,
+            INTERVALO_SCAN - duracao
+        )
+
+        time.sleep(espera)
+
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+def shutdown_handler(signum, frame):
+
+    global rodando
+
+    print(
+        f"🛑 Sinal {signum} recebido. "
+        "Encerrando V4..."
+    )
+
+    rodando = False
+
+
+signal.signal(
+    signal.SIGTERM,
+    shutdown_handler
+)
+
+signal.signal(
+    signal.SIGINT,
+    shutdown_handler
+)
+
+
+# ============================================================
+# WATCHDOG
+# ============================================================
+
+def watchdog():
+
+    print("🛡️ Watchdog iniciado.")
+
+    ultimo_scan_conhecido = 0
+
+    while rodando:
+
+        time.sleep(30)
+
+        ultimo = estado["ultimo_scan"]
+
+        if ultimo is None:
+            continue
+
+        # Se o loop ficar mais de 2 minutos sem registrar scan,
+        # avisamos no log.
+        if ultimo != ultimo_scan_conhecido:
+
+            ultimo_scan_conhecido = ultimo
+
+        idade = time.time() - ultimo
+
+        if idade > 120:
 
             print(
-                "❌ ERRO NO LOOP:",
-                repr(e)
-            )
-
-            time.sleep(
-                INTERVALO_SCAN
+                "🚨 WATCHDOG: "
+                f"sem scan há {idade:.0f}s"
             )
 
 
-# =========================================================
-# START
-# =========================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -1103,4 +1123,13 @@ if __name__ == "__main__":
 
     servidor.start()
 
+    watchdog_thread = threading.Thread(
+        target=watchdog,
+        daemon=True
+    )
+
+    watchdog_thread.start()
+
     monitorar()
+
+    print("V4 encerrado.")
