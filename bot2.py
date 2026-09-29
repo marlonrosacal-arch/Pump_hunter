@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 import requests
 from flask import Flask
 
+
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
@@ -15,37 +16,44 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 MEXC_BASE = "https://api.mexc.com"
 
-# Quantidade de contratos monitorados
 MAX_CONTRATOS = 100
 
-# Intervalo entre as leituras
+# Coleta a cada 5 segundos
 INTERVALO = 5
 
-# Atualiza a seleção de contratos a cada 15 minutos
+# Atualiza a seleção de contratos
 ATUALIZAR_CONTRATOS = 15 * 60
 
-# Histórico mantido por aproximadamente 2 minutos
+# Histórico
 HISTORICO_SEGUNDOS = 130
 
+
 # ============================================================
-# LIMITES DOS ALERTAS
+# FILTROS DE QUALIDADE
 # ============================================================
 
-# ALERTA AMARELO
-PUMP_10S = 0.18
+# Movimento mínimo para entrar no ranking
+MIN_30S = 0.30
+MIN_60S = 0.45
 
-# ALERTA LARANJA
-PUMP_20S = 0.30
-PUMP_30S = 0.45
+# Movimento máximo aceitável em 15s
+# Evita alguns spikes absurdos
+MAX_15S = 5.0
 
-# ALERTA VERMELHO
-PUMP_60S = 0.70
+# Score mínimo para permitir alerta
+SCORE_MINIMO = 55
 
-# Evita considerar movimentos absurdos como sinal normal
-MAX_MOVIMENTO_10S = 5.0
 
-# Tempo mínimo para voltar a alertar a mesma moeda
-COOLDOWN = 8 * 60
+# ============================================================
+# CONTROLE DE ALERTAS
+# ============================================================
+
+# No máximo 1 alerta por minuto
+INTERVALO_ALERTAS = 60
+
+# A mesma moeda só pode voltar depois deste período
+COOLDOWN_MOEDA = 8 * 60
+
 
 # ============================================================
 # ESTRUTURAS
@@ -53,15 +61,19 @@ COOLDOWN = 8 * 60
 
 app = Flask(__name__)
 
-historico = defaultdict(lambda: deque(maxlen=150))
-
-ultimo_alerta = {}
-
-nivel_anterior = {}
+historico = defaultdict(
+    lambda: deque(maxlen=150)
+)
 
 contratos = []
 
 ultima_atualizacao_contratos = 0
+
+ultimo_alerta_global = 0
+
+ultimo_alerta_moeda = {}
+
+melhor_candidato = None
 
 rodando = True
 
@@ -71,11 +83,19 @@ rodando = True
 # ============================================================
 
 def enviar(mensagem):
+
     if not BOT_TOKEN or not CHAT_ID:
-        print("ERRO: BOT_TOKEN ou CHAT_ID não configurado.")
+
+        print(
+            "ERRO: BOT_TOKEN ou CHAT_ID não configurado."
+        )
+
         return False
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendMessage"
+    )
 
     dados = {
         "chat_id": CHAT_ID,
@@ -85,6 +105,7 @@ def enviar(mensagem):
     }
 
     try:
+
         resposta = requests.post(
             url,
             json=dados,
@@ -92,25 +113,40 @@ def enviar(mensagem):
         )
 
         if resposta.status_code != 200:
-            print("Erro Telegram:", resposta.text)
+
+            print(
+                "Erro Telegram:",
+                resposta.text
+            )
+
             return False
 
         return True
 
     except Exception as e:
-        print("Erro enviando Telegram:", e)
+
+        print(
+            "Erro enviando Telegram:",
+            e
+        )
+
         return False
 
 
 # ============================================================
-# PEGAR CONTRATOS PERPÉTUOS
+# CONTRATOS FUTURES
 # ============================================================
 
 def carregar_contratos():
+
     global contratos
 
     try:
-        url = f"{MEXC_BASE}/api/v1/contract/detail"
+
+        url = (
+            f"{MEXC_BASE}"
+            f"/api/v1/contract/detail"
+        )
 
         resposta = requests.get(
             url,
@@ -121,18 +157,33 @@ def carregar_contratos():
 
         dados = resposta.json()
 
-        lista = dados.get("data", [])
+        lista = dados.get(
+            "data",
+            []
+        )
 
         novos = []
 
         for item in lista:
 
-            symbol = item.get("symbol", "")
-            quote = item.get("quoteCoin")
-            settle = item.get("settleCoin")
-            state = item.get("state")
+            symbol = item.get(
+                "symbol",
+                ""
+            )
 
-            # Apenas contratos USDT perpétuos ativos
+            quote = item.get(
+                "quoteCoin"
+            )
+
+            settle = item.get(
+                "settleCoin"
+            )
+
+            state = item.get(
+                "state"
+            )
+
+            # Apenas USDT perpétuo ativo
             if quote != "USDT":
                 continue
 
@@ -142,34 +193,46 @@ def carregar_contratos():
             if state != 0:
                 continue
 
-            if not symbol.endswith("_USDT"):
+            if not symbol.endswith(
+                "_USDT"
+            ):
                 continue
 
             novos.append(symbol)
 
-        contratos = novos
+        if novos:
+
+            contratos = novos
 
         print(
-            f"[CONTRATOS] {len(contratos)} contratos perpétuos USDT encontrados."
+            f"[CONTRATOS] "
+            f"{len(contratos)} encontrados."
         )
 
         return contratos
 
     except Exception as e:
-        print("Erro carregando contratos:", e)
+
+        print(
+            "Erro carregando contratos:",
+            e
+        )
 
         return contratos
 
 
 # ============================================================
-# PEGAR TICKERS DOS FUTUROS
+# TICKERS
 # ============================================================
 
 def obter_tickers():
 
     try:
 
-        url = f"{MEXC_BASE}/api/v1/contract/ticker"
+        url = (
+            f"{MEXC_BASE}"
+            f"/api/v1/contract/ticker"
+        )
 
         resposta = requests.get(
             url,
@@ -180,35 +243,46 @@ def obter_tickers():
 
         dados = resposta.json()
 
-        resultado = dados.get("data")
+        resultado = dados.get(
+            "data"
+        )
 
         if resultado is None:
             return []
 
-        # Dependendo da resposta da API,
-        # data pode ser lista ou objeto.
-        if isinstance(resultado, dict):
+        if isinstance(
+            resultado,
+            list
+        ):
+            return resultado
 
-            # Caso venha uma estrutura paginada
+        if isinstance(
+            resultado,
+            dict
+        ):
+
             if "resultList" in resultado:
-                return resultado["resultList"]
+
+                return resultado[
+                    "resultList"
+                ]
 
             return [resultado]
-
-        if isinstance(resultado, list):
-            return resultado
 
         return []
 
     except Exception as e:
 
-        print("Erro obtendo tickers:", e)
+        print(
+            "Erro obtendo tickers:",
+            e
+        )
 
         return []
 
 
 # ============================================================
-# SELECIONAR OS CONTRATOS MAIS ATIVOS
+# SELEÇÃO DOS CONTRATOS
 # ============================================================
 
 def selecionar_contratos():
@@ -220,22 +294,43 @@ def selecionar_contratos():
     if not tickers:
         return
 
-    candidatos = []
+    conjunto = set(
+        contratos
+    )
 
-    conjunto_contratos = set(contratos)
+    candidatos = []
 
     for ticker in tickers:
 
-        symbol = ticker.get("symbol")
+        symbol = ticker.get(
+            "symbol"
+        )
 
-        if symbol not in conjunto_contratos:
+        if symbol not in conjunto:
             continue
 
         try:
 
-            preco = float(ticker.get("lastPrice", 0))
-            volume = float(ticker.get("volume24", 0))
-            variacao = float(ticker.get("riseFallRate", 0)) * 100
+            preco = float(
+                ticker.get(
+                    "lastPrice",
+                    0
+                )
+            )
+
+            volume = float(
+                ticker.get(
+                    "volume24",
+                    0
+                )
+            )
+
+            variacao = float(
+                ticker.get(
+                    "riseFallRate",
+                    0
+                )
+            ) * 100
 
             if preco <= 0:
                 continue
@@ -243,19 +338,25 @@ def selecionar_contratos():
             if volume <= 0:
                 continue
 
-            # Ignora moedas que já estejam em movimentos extremos
-            # para deixar espaço para detectar novos movimentos.
-            if variacao < -30 or variacao > 30:
+            # Evita moedas já completamente esticadas
+            if variacao < -30:
                 continue
 
-            # Score de atividade:
-            # volume maior = mais prioridade
-            # volatilidade moderada = mais prioridade
-            volatilidade = abs(variacao)
+            if variacao > 30:
+                continue
+
+            volatilidade = abs(
+                variacao
+            )
 
             score = (
-                (volume ** 0.5) *
-                (1 + volatilidade / 10)
+                (volume ** 0.5)
+                *
+                (
+                    1
+                    +
+                    volatilidade / 10
+                )
             )
 
             candidatos.append(
@@ -269,26 +370,23 @@ def selecionar_contratos():
             continue
 
     candidatos.sort(
-        reverse=True,
-        key=lambda x: x[0]
+        reverse=True
     )
 
-    novos_contratos = [
+    selecionados = [
         item[1]
-        for item in candidatos[:MAX_CONTRATOS]
+        for item in candidatos[
+            :MAX_CONTRATOS
+        ]
     ]
 
-    if novos_contratos:
+    if selecionados:
 
-        contratos = novos_contratos
-
-        print(
-            f"[SELEÇÃO] Monitorando {len(contratos)} contratos."
-        )
+        contratos = selecionados
 
         print(
-            "[SELEÇÃO]",
-            ", ".join(contratos[:20])
+            f"[SELEÇÃO] "
+            f"{len(contratos)} contratos."
         )
 
 
@@ -296,11 +394,18 @@ def selecionar_contratos():
 # HISTÓRICO
 # ============================================================
 
-def salvar_preco(symbol, preco, volume, hold_vol):
+def salvar_preco(
+    symbol,
+    preco,
+    volume,
+    hold_vol
+):
 
     agora = time.time()
 
-    historico[symbol].append(
+    historico[
+        symbol
+    ].append(
         {
             "time": agora,
             "price": preco,
@@ -311,31 +416,40 @@ def salvar_preco(symbol, preco, volume, hold_vol):
 
 
 # ============================================================
-# PEGAR PREÇO DE X SEGUNDOS ATRÁS
+# PREÇO ANTERIOR
 # ============================================================
 
-def preco_anterior(symbol, segundos):
+def preco_anterior(
+    symbol,
+    segundos
+):
 
-    agora = time.time()
-
-    dados = historico.get(symbol)
+    dados = historico.get(
+        symbol
+    )
 
     if not dados:
         return None
 
-    alvo = agora - segundos
+    alvo = (
+        time.time()
+        - segundos
+    )
 
     melhor = None
 
     for item in dados:
 
         if item["time"] <= alvo:
+
             melhor = item
 
         else:
+
             break
 
     if melhor:
+
         return melhor["price"]
 
     return None
@@ -345,9 +459,19 @@ def preco_anterior(symbol, segundos):
 # VARIAÇÃO
 # ============================================================
 
-def calcular_variacao(symbol, segundos):
+def variacao(
+    symbol,
+    segundos
+):
 
-    atual = historico[symbol][-1]["price"]
+    dados = historico.get(
+        symbol
+    )
+
+    if not dados:
+        return None
+
+    atual = dados[-1]["price"]
 
     anterior = preco_anterior(
         symbol,
@@ -361,183 +485,422 @@ def calcular_variacao(symbol, segundos):
         return None
 
     return (
-        (atual - anterior) /
+        (
+            atual - anterior
+        )
+        /
         anterior
     ) * 100
 
 
 # ============================================================
-# FORMATAR NÚMEROS
+# SCORE
 # ============================================================
 
-def formatar_preco(preco):
+def calcular_score(
+    symbol
+):
+
+    v15 = variacao(
+        symbol,
+        15
+    )
+
+    v30 = variacao(
+        symbol,
+        30
+    )
+
+    v60 = variacao(
+        symbol,
+        60
+    )
+
+    if v15 is None:
+        return None
+
+    if v30 is None:
+        return None
+
+    if v60 is None:
+        return None
+
+    # ----------------------------------------
+    # FILTROS
+    # ----------------------------------------
+
+    if v30 < MIN_30S:
+        return None
+
+    if v60 < MIN_60S:
+        return None
+
+    if v15 < 0:
+        return None
+
+    if v15 > MAX_15S:
+        return None
+
+    # ----------------------------------------
+    # SCORE DE PREÇO
+    # ----------------------------------------
+
+    score_15 = min(
+        v15 / 0.50,
+        1
+    ) * 25
+
+    score_30 = min(
+        v30 / 1.00,
+        1
+    ) * 30
+
+    score_60 = min(
+        v60 / 1.50,
+        1
+    ) * 25
+
+    # ----------------------------------------
+    # ACELERAÇÃO
+    # ----------------------------------------
+
+    aceleracao = (
+        v30 - v60 / 2
+    )
+
+    score_aceleracao = min(
+        max(
+            aceleracao,
+            0
+        ) / 0.60,
+        1
+    ) * 10
+
+    # ----------------------------------------
+    # CONSISTÊNCIA
+    # ----------------------------------------
+
+    consistencia = 0
+
+    if v15 > 0:
+        consistencia += 3
+
+    if v30 > v15 * 0.8:
+        consistencia += 3
+
+    if v60 > v30:
+        consistencia += 4
+
+    score_consistencia = consistencia
+
+    score = (
+        score_15
+        +
+        score_30
+        +
+        score_60
+        +
+        score_aceleracao
+        +
+        score_consistencia
+    )
+
+    return {
+        "score": min(
+            score,
+            100
+        ),
+        "v15": v15,
+        "v30": v30,
+        "v60": v60
+    }
+
+
+# ============================================================
+# ANALISAR CANDIDATO
+# ============================================================
+
+def analisar_candidato(
+    symbol
+):
+
+    global melhor_candidato
+
+    resultado = calcular_score(
+        symbol
+    )
+
+    if resultado is None:
+        return
+
+    score = resultado[
+        "score"
+    ]
+
+    if score < SCORE_MINIMO:
+        return
+
+    agora = time.time()
+
+    # Cooldown individual
+    ultimo = ultimo_alerta_moeda.get(
+        symbol,
+        0
+    )
+
+    if (
+        agora - ultimo
+        <
+        COOLDOWN_MOEDA
+    ):
+
+        return
+
+    dados = historico[
+        symbol
+    ]
+
+    if not dados:
+        return
+
+    atual = dados[-1]
+
+    candidato = {
+        "symbol": symbol,
+        "score": score,
+        "v15": resultado["v15"],
+        "v30": resultado["v30"],
+        "v60": resultado["v60"],
+        "price": atual["price"],
+        "volume": atual["volume"],
+        "hold": atual["hold"],
+        "time": agora
+    }
+
+    # Guarda somente o melhor
+    if (
+        melhor_candidato is None
+        or
+        score
+        >
+        melhor_candidato["score"]
+    ):
+
+        melhor_candidato = candidato
+
+        print(
+            f"[MELHOR] "
+            f"{symbol} "
+            f"score={score:.1f} "
+            f"30s={resultado['v30']:.2f}% "
+            f"60s={resultado['v60']:.2f}%"
+        )
+
+
+# ============================================================
+# FORMATAÇÃO
+# ============================================================
+
+def formatar_preco(
+    preco
+):
 
     if preco >= 1000:
+
         return f"{preco:,.2f}"
 
     if preco >= 1:
+
         return f"{preco:.4f}"
 
     if preco >= 0.01:
+
         return f"{preco:.6f}"
 
     return f"{preco:.10f}"
 
 
-def formatar_volume(volume):
+def formatar_volume(
+    volume
+):
 
     if volume >= 1_000_000_000:
-        return f"${volume / 1_000_000_000:.2f}B"
+
+        return (
+            f"${volume / 1_000_000_000:.2f}B"
+        )
 
     if volume >= 1_000_000:
-        return f"${volume / 1_000_000:.2f}M"
+
+        return (
+            f"${volume / 1_000_000:.2f}M"
+        )
 
     if volume >= 1_000:
-        return f"${volume / 1_000:.2f}K"
+
+        return (
+            f"${volume / 1_000:.2f}K"
+        )
 
     return f"${volume:.0f}"
 
 
 # ============================================================
-# DETECTOR DE PUMP
+# CLASSIFICAÇÃO
 # ============================================================
 
-def analisar(symbol, ticker):
+def nivel_alerta(
+    candidato
+):
 
-    v10 = calcular_variacao(symbol, 10)
-    v20 = calcular_variacao(symbol, 20)
-    v30 = calcular_variacao(symbol, 30)
-    v60 = calcular_variacao(symbol, 60)
+    v30 = candidato["v30"]
+    v60 = candidato["v60"]
+    score = candidato["score"]
 
-    if v10 is None:
+    if (
+        score >= 85
+        and
+        v30 >= 0.80
+        and
+        v60 >= 1.00
+    ):
+
+        return (
+            "🔴",
+            "MOVIMENTO MUITO FORTE"
+        )
+
+    if (
+        score >= 70
+        and
+        v30 >= 0.50
+        and
+        v60 >= 0.70
+    ):
+
+        return (
+            "🟠",
+            "ACELERAÇÃO FORTE"
+        )
+
+    return (
+        "🟡",
+        "INÍCIO DE MOVIMENTO"
+    )
+
+
+# ============================================================
+# ENVIAR O MELHOR ALERTA
+# ============================================================
+
+def enviar_melhor_alerta():
+
+    global melhor_candidato
+    global ultimo_alerta_global
+
+    if melhor_candidato is None:
+
         return
 
-    if v20 is None:
-        return
-
-    if v30 is None:
-        return
-
-    if v60 is None:
-        return
-
-    # --------------------------------------------------------
-    # SOMENTE MOVIMENTO DE ALTA
-    # --------------------------------------------------------
-
-    if v10 <= 0 and v20 <= 0 and v30 <= 0:
-        nivel = 0
-
-    else:
-
-        # ----------------------------------------------------
-        # NÍVEL 3 - FORTE
-        # ----------------------------------------------------
-
-        if (
-            v60 >= PUMP_60S
-            and v30 >= PUMP_30S
-            and v20 >= PUMP_20S
-        ):
-
-            nivel = 3
-
-        # ----------------------------------------------------
-        # NÍVEL 2 - ACELERAÇÃO
-        # ----------------------------------------------------
-
-        elif (
-            v30 >= PUMP_30S
-            and v20 >= PUMP_20S
-        ):
-
-            nivel = 2
-
-        # ----------------------------------------------------
-        # NÍVEL 1 - INÍCIO
-        # ----------------------------------------------------
-
-        elif v10 >= PUMP_10S:
-
-            nivel = 1
-
-        else:
-
-            nivel = 0
-
-    # Movimento exagerado em poucos segundos
-    # pode ser ruído/spike.
-    if v10 > MAX_MOVIMENTO_10S:
-        nivel = 0
-
-    nivel_antigo = nivel_anterior.get(symbol, 0)
-
-    nivel_anterior[symbol] = nivel
-
-    if nivel <= 0:
-        return
-
-    # Só alerta quando sobe de nível
-    # ou quando passou o cooldown.
     agora = time.time()
 
-    ultimo = ultimo_alerta.get(symbol, 0)
+    # Nunca mais de 1 por minuto
+    if (
+        agora - ultimo_alerta_global
+        <
+        INTERVALO_ALERTAS
+    ):
 
-    passou_cooldown = (
-        agora - ultimo
-    ) >= COOLDOWN
-
-    subiu_de_nivel = nivel > nivel_antigo
-
-    if not subiu_de_nivel and not passou_cooldown:
         return
 
-    ultimo_alerta[symbol] = agora
+    candidato = melhor_candidato
 
-    preco = historico[symbol][-1]["price"]
+    # Limpa antes do envio
+    melhor_candidato = None
 
-    volume = historico[symbol][-1]["volume"]
+    symbol = candidato[
+        "symbol"
+    ]
 
-    hold = historico[symbol][-1]["hold"]
+    score = candidato[
+        "score"
+    ]
 
-    if nivel == 1:
+    v15 = candidato[
+        "v15"
+    ]
 
-        titulo = "🟡 INÍCIO DE MOVIMENTO"
+    v30 = candidato[
+        "v30"
+    ]
 
-    elif nivel == 2:
+    v60 = candidato[
+        "v60"
+    ]
 
-        titulo = "🟠 ACELERAÇÃO FORTE"
+    preco = candidato[
+        "price"
+    ]
 
-    else:
+    volume = candidato[
+        "volume"
+    ]
 
-        titulo = "🔴 MOVIMENTO MUITO FORTE"
+    hold = candidato[
+        "hold"
+    ]
+
+    emoji, titulo = nivel_alerta(
+        candidato
+    )
 
     mensagem = (
-        f"<b>{titulo}</b>\n\n"
+        f"{emoji} <b>{titulo}</b>\n\n"
+
         f"🚀 <b>{symbol}</b>\n"
-        f"💰 Preço: <b>{formatar_preco(preco)}</b>\n\n"
 
-        f"⚡ 10s: <b>+{v10:.2f}%</b>\n"
-        f"⚡ 20s: <b>+{v20:.2f}%</b>\n"
-        f"⚡ 30s: <b>+{v30:.2f}%</b>\n"
-        f"⚡ 60s: <b>+{v60:.2f}%</b>\n\n"
+        f"⭐ Score: "
+        f"<b>{score:.0f}/100</b>\n\n"
 
-        f"📊 Volume 24h: <b>{formatar_volume(volume)}</b>\n"
-        f"📈 Open Interest: <b>{hold:,.0f}</b>\n\n"
+        f"💰 Preço: "
+        f"<b>{formatar_preco(preco)}</b>\n\n"
 
-        f"⚠️ <i>Sinal de aceleração de preço. "
-        f"Não significa que o movimento continuará.</i>"
+        f"⚡ 15s: "
+        f"<b>+{v15:.2f}%</b>\n"
+
+        f"⚡ 30s: "
+        f"<b>+{v30:.2f}%</b>\n"
+
+        f"⚡ 60s: "
+        f"<b>+{v60:.2f}%</b>\n\n"
+
+        f"📊 Volume 24h: "
+        f"<b>{formatar_volume(volume)}</b>\n"
+
+        f"📈 Open Interest: "
+        f"<b>{hold:,.0f}</b>\n\n"
+
+        f"🏆 <b>Melhor sinal "
+        f"detectado no último minuto.</b>\n\n"
+
+        f"⚠️ <i>O score mede força do "
+        f"movimento observado; não prevê "
+        f"que o preço continuará subindo.</i>"
     )
 
-    print(
-        f"[ALERTA {nivel}] {symbol} "
-        f"10s={v10:.2f}% "
-        f"20s={v20:.2f}% "
-        f"30s={v30:.2f}% "
-        f"60s={v60:.2f}%"
-    )
+    if enviar(mensagem):
 
-    enviar(mensagem)
+        ultimo_alerta_global = agora
+
+        ultimo_alerta_moeda[
+            symbol
+        ] = agora
+
+        print(
+            f"[ALERTA ENVIADO] "
+            f"{symbol} "
+            f"score={score:.1f}"
+        )
 
 
 # ============================================================
@@ -550,11 +913,18 @@ def verificar():
 
     agora = time.time()
 
-    # Atualiza a lista de contratos
+    # ----------------------------------------
+    # Atualizar contratos
+    # ----------------------------------------
+
     if (
         not contratos
-        or agora - ultima_atualizacao_contratos
-        >= ATUALIZAR_CONTRATOS
+        or
+        agora
+        -
+        ultima_atualizacao_contratos
+        >=
+        ATUALIZAR_CONTRATOS
     ):
 
         carregar_contratos()
@@ -563,73 +933,113 @@ def verificar():
 
         ultima_atualizacao_contratos = agora
 
+    # ----------------------------------------
+    # Tickers
+    # ----------------------------------------
+
     tickers = obter_tickers()
 
     if not tickers:
+
         return
 
-    ativos = set(contratos)
+    ativos = set(
+        contratos
+    )
 
     for ticker in tickers:
 
-        symbol = ticker.get("symbol")
+        symbol = ticker.get(
+            "symbol"
+        )
 
         if symbol not in ativos:
+
             continue
 
         try:
 
             preco = float(
-                ticker.get("lastPrice", 0)
+                ticker.get(
+                    "lastPrice",
+                    0
+                )
             )
 
             volume = float(
-                ticker.get("volume24", 0)
+                ticker.get(
+                    "volume24",
+                    0
+                )
             )
 
-            hold_vol = float(
-                ticker.get("holdVol", 0)
+            hold = float(
+                ticker.get(
+                    "holdVol",
+                    0
+                )
             )
 
             if preco <= 0:
+
                 continue
 
             salvar_preco(
                 symbol,
                 preco,
                 volume,
-                hold_vol
+                hold
             )
 
-            analisar(
-                symbol,
-                ticker
+            analisar_candidato(
+                symbol
             )
 
         except Exception as e:
 
             print(
-                f"Erro processando {symbol}: {e}"
+                f"Erro {symbol}:",
+                e
             )
 
 
 # ============================================================
-# LOOP PRINCIPAL
+# LOOP DO BOT
 # ============================================================
 
 def loop_bot():
 
+    global melhor_candidato
+
     print("=" * 60)
-    print("BOT 2 - MEXC FUTURES PUMP HUNTER")
+
+    print(
+        "MEXC FUTURES "
+        "PUMP HUNTER - RANKING"
+    )
+
     print("=" * 60)
 
     enviar(
-        "🚀 <b>BOT MEXC FUTURES INICIADO</b>\n\n"
-        "🎯 Monitorando contratos perpétuos USDT\n"
-        "🔎 Procurando acelerações rápidas\n"
-        "📊 Analisando preço + volume + open interest\n"
-        "⚡ Janela de análise: 10s / 20s / 30s / 60s\n\n"
-        "⏳ Construindo histórico..."
+        "🚀 <b>MEXC FUTURES "
+        "PUMP HUNTER</b>\n\n"
+
+        "🎯 Monitorando perpétuos USDT\n"
+
+        "🔎 Até 100 contratos\n"
+
+        "📊 Ranking de força 0-100\n"
+
+        "⚡ Análise 15s / 30s / 60s\n\n"
+
+        "🏆 Enviando somente o "
+        "<b>melhor sinal por minuto</b>."
+    )
+
+    proximo_minuto = (
+        time.time()
+        +
+        60
     )
 
     while rodando:
@@ -643,18 +1053,40 @@ def loop_bot():
         except Exception as e:
 
             print(
-                "Erro no loop:",
+                "Erro:",
                 e
             )
 
-        duracao = time.time() - inicio
+        # ------------------------------------
+        # A cada minuto escolhe o melhor
+        # ------------------------------------
+
+        agora = time.time()
+
+        if agora >= proximo_minuto:
+
+            enviar_melhor_alerta()
+
+            proximo_minuto = (
+                agora
+                +
+                60
+            )
+
+        duracao = (
+            time.time()
+            -
+            inicio
+        )
 
         espera = max(
             1,
             INTERVALO - duracao
         )
 
-        time.sleep(espera)
+        time.sleep(
+            espera
+        )
 
 
 # ============================================================
@@ -666,25 +1098,37 @@ def home():
 
     return """
     <html>
+
     <head>
-        <title>MEXC Futures Pump Hunter</title>
+        <title>
+            MEXC Futures Pump Hunter
+        </title>
     </head>
 
     <body>
 
-        <h1>🚀 MEXC Futures Pump Hunter</h1>
-
-        <p>Bot online.</p>
+        <h1>
+            🚀 MEXC Futures Pump Hunter
+        </h1>
 
         <p>
-        Monitorando contratos perpétuos USDT.
+            Bot online.
         </p>
 
         <p>
-        Detector: 10s / 20s / 30s / 60s.
+            Monitorando perpétuos USDT.
+        </p>
+
+        <p>
+            Ranking de sinais ativo.
+        </p>
+
+        <p>
+            Máximo: 1 alerta por minuto.
         </p>
 
     </body>
+
     </html>
     """
 
@@ -694,14 +1138,27 @@ def status():
 
     return {
         "status": "online",
-        "contratos_monitorados": len(contratos),
-        "historicos": len(historico),
-        "alertas_registrados": len(ultimo_alerta)
+        "contratos_monitorados": len(
+            contratos
+        ),
+        "historicos": len(
+            historico
+        ),
+        "ultimo_alerta": (
+            ultimo_alerta_global
+        ),
+        "melhor_candidato": (
+            melhor_candidato[
+                "symbol"
+            ]
+            if melhor_candidato
+            else None
+        )
     }
 
 
 # ============================================================
-# INICIAR
+# INICIALIZAÇÃO
 # ============================================================
 
 if __name__ == "__main__":
