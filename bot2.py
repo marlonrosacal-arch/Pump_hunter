@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import sqlite3
+import json
 from collections import deque
 from datetime import datetime, timezone
 
@@ -1512,3 +1513,1583 @@ def symbol_recently_alerted(symbol):
         time.time() - last
         < COOLDOWN_SYMBOL
     )
+# ============================================================
+# REGISTRO DOS SINAIS
+# ============================================================
+
+def register_signal(candidate, detected_at):
+
+    symbol = candidate["symbol"]
+
+    if symbol_recently_alerted(symbol):
+        return None
+
+    with db_lock:
+        conn = db_connect()
+
+        cur = conn.execute("""
+        INSERT INTO signals (
+            detected_at,
+            detected_at_str,
+            symbol,
+            side,
+            alert_sent,
+            alert_sent_at,
+
+            entry_price,
+            stop_price,
+            tp1_price,
+            tp2_price,
+
+            score,
+            raw_score,
+
+            structure_score,
+            trend_score,
+            volume_score,
+            momentum_score,
+            oi_score,
+            volatility_score,
+            market_score,
+            entry_score,
+
+            r5,
+            r10,
+            r15,
+            r30,
+            r60,
+
+            accel_15,
+            accel_5,
+
+            rsi,
+            rsi_delta,
+
+            ema9,
+            ema21,
+            ema50,
+
+            oi_change,
+
+            btc15,
+            btc30,
+            btc60,
+
+            eth15,
+            eth30,
+            eth60,
+
+            volume_ratio,
+
+            breakout,
+            false_breakout,
+
+            setup_quality,
+            reasons
+        )
+        VALUES (
+            ?,?,?,?,?,?,
+            ?,?,?,?,
+            ?,?,
+            ?,?,?,?,?,?,?,?,
+            ?,?,?,?,?,
+            ?,?,
+            ?,?,
+            ?,?,?,
+            ?,
+            ?,?,?,
+            ?,?,?,
+            ?,
+            ?,?,
+            ?,?
+        )
+        """, (
+            detected_at,
+            datetime.fromtimestamp(
+                detected_at,
+                timezone.utc
+            ).isoformat(),
+
+            symbol,
+            candidate["side"],
+
+            1,
+            time.time(),
+
+            candidate["entry"],
+            candidate["stop"],
+            candidate["tp1"],
+            candidate["tp2"],
+
+            candidate["score"],
+            candidate["raw_score"],
+
+            candidate["structure_score"],
+            candidate["trend_score"],
+            candidate["volume_score"],
+            candidate["momentum_score"],
+            candidate["oi_score"],
+            candidate["volatility_score"],
+            candidate["market_score"],
+            candidate["entry_score"],
+
+            candidate["r5"],
+            candidate["r10"],
+            candidate["r15"],
+            candidate["r30"],
+            candidate["r60"],
+
+            candidate["accel15"],
+            candidate["accel5"],
+
+            candidate["rsi"],
+            candidate["rsi_delta"],
+
+            candidate["ema9"],
+            candidate["ema21"],
+            candidate["ema50"],
+
+            candidate["oi_change"],
+
+            candidate["btc15"],
+            candidate["btc30"],
+            candidate["btc60"],
+
+            candidate["eth15"],
+            candidate["eth30"],
+            candidate["eth60"],
+
+            candidate["volume_ratio"],
+
+            int(candidate["breakout"]),
+            int(candidate["false_breakout"]),
+
+            candidate["quality"],
+
+            json.dumps({
+                "reasons": candidate["reasons"],
+                "penalties": candidate["penalties"]
+            }, ensure_ascii=False)
+        ))
+
+        signal_id = cur.lastrowid
+
+        conn.commit()
+        conn.close()
+
+    last_alert_symbol[symbol] = time.time()
+
+    active_observations[signal_id] = {
+        "id": signal_id,
+        "symbol": symbol,
+        "side": candidate["side"],
+        "entry": candidate["entry"],
+        "detected_at": detected_at,
+
+        "max_fav": 0.0,
+        "max_adv": 0.0,
+
+        "mfe_at": detected_at,
+        "mfe_elapsed": 0.0,
+
+        "mae_at": detected_at,
+        "mae_elapsed": 0.0,
+
+        "outcome": None,
+        "outcome_at": None,
+        "outcome_elapsed": None
+    }
+
+    return signal_id
+
+
+# ============================================================
+# RETORNO AJUSTADO PARA LONG / SHORT
+# ============================================================
+
+def side_return(side, entry, price):
+
+    if not entry or entry <= 0:
+        return 0.0
+
+    raw = pct_change(
+        entry,
+        price
+    )
+
+    if side == "SHORT":
+        return -raw
+
+    return raw
+
+
+# ============================================================
+# LABORATÓRIO — ACOMPANHAMENTO
+# ============================================================
+
+def update_active_observations(tickers, now):
+
+    prices = {
+        x["symbol"]: x["price"]
+        for x in tickers
+    }
+
+    finished = []
+
+    for signal_id, obs in list(
+        active_observations.items()
+    ):
+
+        price = prices.get(
+            obs["symbol"]
+        )
+
+        if price is None:
+            continue
+
+        elapsed = (
+            now - obs["detected_at"]
+        )
+
+        ret = side_return(
+            obs["side"],
+            obs["entry"],
+            price
+        )
+
+        # ----------------------------------------------------
+        # MFE
+        # ----------------------------------------------------
+
+        if ret > obs["max_fav"]:
+
+            obs["max_fav"] = ret
+
+            obs["mfe_at"] = now
+
+            obs["mfe_elapsed"] = elapsed
+
+        # ----------------------------------------------------
+        # MAE
+        # ----------------------------------------------------
+
+        if ret < obs["max_adv"]:
+
+            obs["max_adv"] = ret
+
+            obs["mae_at"] = now
+
+            obs["mae_elapsed"] = elapsed
+
+        # ----------------------------------------------------
+        # RESULTADO
+        # ----------------------------------------------------
+
+        if obs["outcome"] is None:
+
+            if ret >= GAIN_TARGET:
+
+                obs["outcome"] = "GAIN"
+
+                obs["outcome_at"] = now
+
+                obs["outcome_elapsed"] = elapsed
+
+            elif ret <= LOSS_TARGET:
+
+                obs["outcome"] = "LOSS"
+
+                obs["outcome_at"] = now
+
+                obs["outcome_elapsed"] = elapsed
+
+        # ----------------------------------------------------
+        # HORIZONTES
+        # ----------------------------------------------------
+
+        fields = {}
+
+        if elapsed >= 30:
+            fields["ret_30"] = ret
+
+        if elapsed >= 60:
+            fields["ret_60"] = ret
+
+        if elapsed >= 180:
+            fields["ret_180"] = ret
+
+        if elapsed >= 300:
+            fields["ret_300"] = ret
+
+        if elapsed >= 600:
+            fields["ret_600"] = ret
+
+        if elapsed >= 900:
+            fields["ret_900"] = ret
+
+        # ----------------------------------------------------
+        # FINAL DOS 15 MINUTOS
+        # ----------------------------------------------------
+
+        if elapsed >= LAB_WINDOW:
+
+            if obs["outcome"] is None:
+
+                obs["outcome"] = "NEUTRAL"
+
+                obs["outcome_at"] = now
+
+                obs["outcome_elapsed"] = LAB_WINDOW
+
+            fields.update({
+
+                "mfe_900":
+                    obs["max_fav"],
+
+                "mae_900":
+                    obs["max_adv"],
+
+                "max_fav":
+                    obs["max_fav"],
+
+                "max_adv":
+                    obs["max_adv"],
+
+                "mfe_at":
+                    obs["mfe_at"],
+
+                "mfe_elapsed":
+                    obs["mfe_elapsed"],
+
+                "mae_at":
+                    obs["mae_at"],
+
+                "mae_elapsed":
+                    obs["mae_elapsed"],
+
+                "outcome":
+                    obs["outcome"],
+
+                "outcome_at":
+                    obs["outcome_at"],
+
+                "outcome_elapsed":
+                    obs["outcome_elapsed"],
+
+                "complete":
+                    1,
+
+                "completed_at":
+                    now
+            })
+
+            finished.append(
+                signal_id
+            )
+
+        # ----------------------------------------------------
+        # SALVA NO BANCO
+        # ----------------------------------------------------
+
+        if fields:
+
+            assignments = ", ".join(
+                f"{key}=?"
+                for key in fields
+            )
+
+            with db_lock:
+
+                conn = db_connect()
+
+                conn.execute(
+                    f"""
+                    UPDATE signals
+                    SET {assignments}
+                    WHERE id=?
+                    """,
+                    (
+                        *fields.values(),
+                        signal_id
+                    )
+                )
+
+                conn.commit()
+                conn.close()
+
+    # --------------------------------------------------------
+    # REMOVE FINALIZADOS DA MEMÓRIA
+    # --------------------------------------------------------
+
+    for signal_id in finished:
+
+        active_observations.pop(
+            signal_id,
+            None
+        )
+
+
+# ============================================================
+# RECUPERA OBSERVAÇÕES APÓS RESTART
+# ============================================================
+
+def load_pending_observations():
+
+    active_observations.clear()
+
+    cutoff = (
+        time.time()
+        - LAB_WINDOW
+        - 300
+    )
+
+    with db_lock:
+
+        conn = db_connect()
+
+        rows = conn.execute("""
+        SELECT
+            id,
+            symbol,
+            side,
+            entry_price,
+            detected_at,
+
+            max_fav,
+            max_adv,
+
+            mfe_at,
+            mfe_elapsed,
+
+            mae_at,
+            mae_elapsed,
+
+            outcome,
+            outcome_at,
+            outcome_elapsed
+
+        FROM signals
+
+        WHERE alert_sent=1
+        AND complete=0
+        AND detected_at >= ?
+        """, (
+            cutoff,
+        )).fetchall()
+
+        conn.close()
+
+    for row in rows:
+
+        active_observations[
+            row["id"]
+        ] = {
+
+            "id":
+                row["id"],
+
+            "symbol":
+                row["symbol"],
+
+            "side":
+                row["side"] or "LONG",
+
+            "entry":
+                row["entry_price"],
+
+            "detected_at":
+                row["detected_at"],
+
+            "max_fav":
+                row["max_fav"] or 0.0,
+
+            "max_adv":
+                row["max_adv"] or 0.0,
+
+            "mfe_at":
+                row["mfe_at"]
+                or row["detected_at"],
+
+            "mfe_elapsed":
+                row["mfe_elapsed"]
+                or 0.0,
+
+            "mae_at":
+                row["mae_at"]
+                or row["detected_at"],
+
+            "mae_elapsed":
+                row["mae_elapsed"]
+                or 0.0,
+
+            "outcome":
+                row["outcome"],
+
+            "outcome_at":
+                row["outcome_at"],
+
+            "outcome_elapsed":
+                row["outcome_elapsed"]
+        }
+
+
+# ============================================================
+# RELATÓRIO — DADOS
+# ============================================================
+
+def completed_rows_after(
+    cursor_id,
+    limit=100
+):
+
+    with db_lock:
+
+        conn = db_connect()
+
+        rows = conn.execute("""
+        SELECT *
+        FROM signals
+
+        WHERE id > ?
+
+        AND alert_sent=1
+
+        AND complete=1
+
+        AND outcome IN (
+            'GAIN',
+            'LOSS',
+            'NEUTRAL'
+        )
+
+        ORDER BY id ASC
+
+        LIMIT ?
+        """, (
+            cursor_id,
+            limit
+        )).fetchall()
+
+        conn.close()
+
+    return rows
+
+
+def completed_since(seconds):
+
+    cutoff = (
+        time.time()
+        - seconds
+    )
+
+    with db_lock:
+
+        conn = db_connect()
+
+        rows = conn.execute("""
+        SELECT *
+        FROM signals
+
+        WHERE alert_sent=1
+
+        AND complete=1
+
+        AND outcome IN (
+            'GAIN',
+            'LOSS',
+            'NEUTRAL'
+        )
+
+        AND completed_at >= ?
+
+        ORDER BY id ASC
+        """, (
+            cutoff,
+        )).fetchall()
+
+        conn.close()
+
+    return rows
+
+
+# ============================================================
+# ESTATÍSTICAS
+# ============================================================
+
+def report_metrics(rows):
+
+    total = len(rows)
+
+    if total == 0:
+        return None
+
+    gains = [
+        r for r in rows
+        if r["outcome"] == "GAIN"
+    ]
+
+    losses = [
+        r for r in rows
+        if r["outcome"] == "LOSS"
+    ]
+
+    neutral = [
+        r for r in rows
+        if r["outcome"] == "NEUTRAL"
+    ]
+
+    def average(
+        column,
+        subset
+    ):
+
+        values = [
+            float(r[column])
+            for r in subset
+            if r[column] is not None
+        ]
+
+        if not values:
+            return 0.0
+
+        return (
+            sum(values)
+            / len(values)
+        )
+
+    return {
+
+        "total":
+            total,
+
+        "gain":
+            len(gains),
+
+        "loss":
+            len(losses),
+
+        "neutral":
+            len(neutral),
+
+        "gain_pct":
+            len(gains)
+            / total
+            * 100,
+
+        "loss_pct":
+            len(losses)
+            / total
+            * 100,
+
+        "neutral_pct":
+            len(neutral)
+            / total
+            * 100,
+
+        "mfe":
+            average(
+                "mfe_900",
+                rows
+            ),
+
+        "mae":
+            average(
+                "mae_900",
+                rows
+            ),
+
+        "ret5":
+            average(
+                "ret_300",
+                rows
+            ),
+
+        "ret15":
+            average(
+                "ret_900",
+                rows
+            ),
+
+        "gain_time":
+            average(
+                "outcome_elapsed",
+                gains
+            ),
+
+        "loss_time":
+            average(
+                "outcome_elapsed",
+                losses
+            )
+    }
+
+
+# ============================================================
+# PADRÕES
+# ============================================================
+
+def bucket_lines(rows):
+
+    buckets = [
+
+        (
+            "Score 76-81",
+            lambda r:
+                76 <=
+                (r["score"] or 0)
+                < 82
+        ),
+
+        (
+            "Score 82-85",
+            lambda r:
+                82 <=
+                (r["score"] or 0)
+                < 86
+        ),
+
+        (
+            "Score 86+",
+            lambda r:
+                (r["score"] or 0)
+                >= 86
+        ),
+
+        (
+            "LONG",
+            lambda r:
+                r["side"] == "LONG"
+        ),
+
+        (
+            "SHORT",
+            lambda r:
+                r["side"] == "SHORT"
+        ),
+
+        (
+            "Rompimento",
+            lambda r:
+                bool(
+                    r["breakout"]
+                )
+        ),
+
+        (
+            "OI positivo",
+            lambda r:
+                (r["oi_change"] or 0)
+                > 0.20
+        ),
+
+        (
+            "Volume >= 1.5x",
+            lambda r:
+                (r["volume_ratio"] or 0)
+                >= 1.5
+        )
+    ]
+
+    output = []
+
+    for name, condition in buckets:
+
+        subset = [
+            r
+            for r in rows
+            if condition(r)
+        ]
+
+        if len(subset) < MIN_PATTERN_SAMPLE:
+            continue
+
+        metrics = report_metrics(
+            subset
+        )
+
+        output.append(
+            f"• {name}: "
+            f"n={metrics['total']} | "
+            f"G {metrics['gain_pct']:.0f}% | "
+            f"L {metrics['loss_pct']:.0f}% | "
+            f"N {metrics['neutral_pct']:.0f}% | "
+            f"MFE {metrics['mfe']:.2f}%"
+        )
+
+    return output
+
+
+# ============================================================
+# CONSTRÓI RELATÓRIO
+# ============================================================
+
+def build_report(
+    title,
+    rows
+):
+
+    metrics = report_metrics(
+        rows
+    )
+
+    if not metrics:
+
+        return (
+            f"*{title}*\n\n"
+            "Nenhum sinal concluído no período."
+        )
+
+    text = [
+
+        f"📊 *{title}*",
+        "",
+
+        f"Sinais avaliados: "
+        f"*{metrics['total']}*",
+
+        "",
+
+        f"🟢 GAIN: "
+        f"*{metrics['gain']} "
+        f"({metrics['gain_pct']:.1f}%)*",
+
+        f"🔴 LOSS: "
+        f"*{metrics['loss']} "
+        f"({metrics['loss_pct']:.1f}%)*",
+
+        f"🟡 NEUTRAL: "
+        f"*{metrics['neutral']} "
+        f"({metrics['neutral_pct']:.1f}%)*",
+
+        "",
+
+        f"MFE médio 15m: "
+        f"*{metrics['mfe']:.2f}%*",
+
+        f"MAE médio 15m: "
+        f"*{metrics['mae']:.2f}%*",
+
+        f"Retorno médio 5m: "
+        f"*{metrics['ret5']:.2f}%*",
+
+        f"Retorno médio 15m: "
+        f"*{metrics['ret15']:.2f}%*",
+
+        f"Tempo médio GAIN: "
+        f"*{metrics['gain_time']/60:.1f} min*",
+
+        f"Tempo médio LOSS: "
+        f"*{metrics['loss_time']/60:.1f} min*"
+    ]
+
+    patterns = bucket_lines(
+        rows
+    )
+
+    if patterns:
+
+        text += [
+            "",
+            "*Padrões com amostra suficiente:*"
+        ]
+
+        text += patterns
+
+    text += [
+        "",
+        "ℹ️ Relatório diagnóstico.",
+        "Nenhuma alteração automática "
+        "da estratégia."
+    ]
+
+    return "\n".join(text)
+
+
+# ============================================================
+# RELATÓRIOS AUTOMÁTICOS
+# ============================================================
+
+def maybe_send_reports():
+
+    now = time.time()
+
+    # --------------------------------------------------------
+    # BLOCO DE 100
+    # --------------------------------------------------------
+
+    cursor = int(
+        float(
+            get_meta(
+                "last_block_cursor_id",
+                0
+            ) or 0
+        )
+    )
+
+    rows = completed_rows_after(
+        cursor,
+        REPORT_BLOCK_SIZE
+    )
+
+    if len(rows) >= REPORT_BLOCK_SIZE:
+
+        block = rows[
+            :REPORT_BLOCK_SIZE
+        ]
+
+        title = (
+            "V5.2 — BLOCO "
+            f"{block[0]['id']}-"
+            f"{block[-1]['id']}"
+        )
+
+        if send_telegram(
+            build_report(
+                title,
+                block
+            )
+        ):
+
+            set_meta(
+                "last_block_cursor_id",
+                block[-1]["id"]
+            )
+
+    # --------------------------------------------------------
+    # SEMANAL
+    # --------------------------------------------------------
+
+    last_weekly = float(
+        get_meta(
+            "last_weekly_report_at",
+            0
+        ) or 0
+    )
+
+    if (
+        now - last_weekly
+        >= WEEKLY_SECONDS
+    ):
+
+        weekly_rows = completed_since(
+            WEEKLY_SECONDS
+        )
+
+        if send_telegram(
+            build_report(
+                "V5.2 — RELATÓRIO SEMANAL",
+                weekly_rows
+            )
+        ):
+
+            set_meta(
+                "last_weekly_report_at",
+                now
+            )
+
+
+# ============================================================
+# ALERTA TELEGRAM
+# ============================================================
+
+def format_alert(candidate):
+
+    side = candidate["side"]
+
+    icon = (
+        "🟢"
+        if side == "LONG"
+        else "🔴"
+    )
+
+    reasons = "\n".join(
+        f"✓ {reason}"
+        for reason
+        in candidate["reasons"][:6]
+    )
+
+    if not reasons:
+        reasons = "✓ Estrutura compatível"
+
+    penalties = "\n".join(
+        f"⚠️ {penalty}"
+        for penalty
+        in candidate["penalties"][:4]
+    )
+
+    message = [
+
+        f"{icon} *{side} — "
+        f"{candidate['symbol']}*",
+
+        "",
+
+        f"*Score:* "
+        f"{candidate['score']:.0f}/100",
+
+        f"*Qualidade:* "
+        f"{candidate['quality']}",
+
+        "",
+
+        f"*Entrada:* "
+        f"`{candidate['entry']:.8g}`",
+
+        f"*Stop:* "
+        f"`{candidate['stop']:.8g}`",
+
+        f"*TP1:* "
+        f"`{candidate['tp1']:.8g}`",
+
+        f"*TP2:* "
+        f"`{candidate['tp2']:.8g}`",
+
+        "",
+
+        f"*R:R TP1:* "
+        f"{candidate['rr1']:.1f}",
+
+        f"*R:R TP2:* "
+        f"{candidate['rr2']:.1f}",
+
+        f"*Regime:* "
+        f"{candidate['regime']}",
+
+        "",
+
+        "*Motivos:*",
+
+        reasons
+    ]
+
+    if penalties:
+
+        message += [
+            "",
+            "*Atenções:*",
+            penalties
+        ]
+
+    message += [
+        "",
+        "⚠️ *Entrada ainda não executada*"
+    ]
+
+    return "\n".join(
+        message
+    )
+
+
+# ============================================================
+# ESCOLHA DO MELHOR SINAL
+# ============================================================
+
+def choose_best(
+    candidates,
+    now
+):
+
+    available = [
+
+        candidate
+
+        for candidate
+        in candidates
+
+        if not symbol_recently_alerted(
+            candidate["symbol"]
+        )
+    ]
+
+    if not available:
+        return None
+
+    available.sort(
+        key=lambda candidate: (
+
+            candidate["score"],
+
+            candidate["quality"]
+            == "STRONG",
+
+            candidate["volume_ratio"],
+
+            abs(
+                candidate["r15"]
+            )
+        ),
+
+        reverse=True
+    )
+
+    return available[0]
+
+
+# ============================================================
+# MONITOR PRINCIPAL
+# ============================================================
+
+def monitor_loop():
+
+    global last_scan_at
+    global last_successful_scan
+    global scan_count
+    global contracts
+
+    last_contract_refresh = 0
+
+    last_alert_global_local = 0
+
+    while running:
+
+        started = time.time()
+
+        last_scan_at = started
+
+        try:
+
+            # ------------------------------------------------
+            # CONTRATOS
+            # ------------------------------------------------
+
+            if (
+                not contracts
+                or
+                started
+                - last_contract_refresh
+                >= CONTRACT_REFRESH
+            ):
+
+                refresh_contracts()
+
+                last_contract_refresh = started
+
+            # ------------------------------------------------
+            # TICKERS
+            # ------------------------------------------------
+
+            tickers = get_all_tickers()
+
+            if not tickers:
+
+                time.sleep(
+                    SCAN_INTERVAL
+                )
+
+                continue
+
+            last_successful_scan = (
+                time.time()
+            )
+
+            scan_count += 1
+
+            by_symbol = {
+                ticker["symbol"]:
+                ticker
+
+                for ticker
+                in tickers
+            }
+
+            # ------------------------------------------------
+            # BTC / ETH
+            # ------------------------------------------------
+
+            btc = by_symbol.get(
+                "BTC_USDT"
+            )
+
+            if btc:
+
+                btc_history.append(
+                    (
+                        btc["timestamp"],
+                        btc["price"],
+                        btc["oi"],
+                        btc["amount24"]
+                    )
+                )
+
+            eth = by_symbol.get(
+                "ETH_USDT"
+            )
+
+            if eth:
+
+                eth_history.append(
+                    (
+                        eth["timestamp"],
+                        eth["price"],
+                        eth["oi"],
+                        eth["amount24"]
+                    )
+                )
+
+            # ------------------------------------------------
+            # RANKING POR LIQUIDEZ
+            # ------------------------------------------------
+
+            ranked = sorted(
+                tickers,
+
+                key=lambda ticker:
+                    ticker["amount24"],
+
+                reverse=True
+            )
+
+            selected = [
+
+                ticker
+
+                for ticker
+                in ranked
+
+                if ticker["symbol"]
+                in contracts
+
+            ][:MAX_CONTRACTS]
+
+            # ------------------------------------------------
+            # HISTÓRICO
+            # ------------------------------------------------
+
+            for ticker in selected:
+
+                symbol = ticker[
+                    "symbol"
+                ]
+
+                history = histories.setdefault(
+                    symbol,
+                    deque(
+                        maxlen=MAX_HISTORY
+                    )
+                )
+
+                history.append(
+                    (
+                        ticker["timestamp"],
+                        ticker["price"],
+                        ticker["oi"],
+                        ticker["amount24"]
+                    )
+                )
+
+            # ------------------------------------------------
+            # LABORATÓRIO
+            # ------------------------------------------------
+
+            update_active_observations(
+                tickers,
+                time.time()
+            )
+
+            # ------------------------------------------------
+            # CONTEXTO
+            # ------------------------------------------------
+
+            market = market_context()
+
+            candidates = []
+
+            # ------------------------------------------------
+            # ANALISA MOEDAS
+            # ------------------------------------------------
+
+            for ticker in selected:
+
+                symbol = ticker[
+                    "symbol"
+                ]
+
+                if symbol in (
+                    "BTC_USDT",
+                    "ETH_USDT"
+                ):
+                    continue
+
+                history = histories.get(
+                    symbol
+                )
+
+                if not history:
+                    continue
+
+                candidate = analyze(
+                    symbol,
+                    history,
+                    ticker,
+                    market
+                )
+
+                if candidate:
+
+                    candidates.append(
+                        candidate
+                    )
+
+            # ------------------------------------------------
+            # MELHOR OPORTUNIDADE
+            # ------------------------------------------------
+
+            best = choose_best(
+                candidates,
+                time.time()
+            )
+
+            # ------------------------------------------------
+            # ALERTA
+            # ------------------------------------------------
+
+            if (
+                best
+
+                and
+
+                time.time()
+                - last_alert_global_local
+                >= ALERT_INTERVAL
+            ):
+
+                message = format_alert(
+                    best
+                )
+
+                sent = send_telegram(
+                    message
+                )
+
+                if sent:
+
+                    signal_id = register_signal(
+                        best,
+                        time.time()
+                    )
+
+                    if signal_id:
+
+                        last_alert_global_local = (
+                            time.time()
+                        )
+
+                        print(
+                            "[ALERT]",
+                            best["side"],
+                            best["symbol"],
+                            f"score={best['score']:.0f}"
+                        )
+
+            # ------------------------------------------------
+            # RELATÓRIOS
+            # ------------------------------------------------
+
+            maybe_send_reports()
+
+            # ------------------------------------------------
+            # LOG
+            # ------------------------------------------------
+
+            if scan_count % 12 == 0:
+
+                print(
+                    f"[SCAN] {scan_count} | "
+                    f"Monitoradas: "
+                    f"{len(selected)}/"
+                    f"{MAX_CONTRACTS} | "
+                    f"Candidatos: "
+                    f"{len(candidates)} | "
+                    f"melhor="
+                    f"{best['symbol'] "
+                    f"if best else 'nenhuma'} | "
+                    f"BTC15="
+                    f"{market['btc15']:.2f}% | "
+                    f"BTC60="
+                    f"{market['btc60']:.2f}% | "
+                    f"regime="
+                    f"{market['regime']}"
+                )
+
+        except Exception as error:
+
+            print(
+                "[MONITOR ERROR]",
+                type(error).__name__,
+                ":",
+                error
+            )
+
+        elapsed = (
+            time.time()
+            - started
+        )
+
+        time.sleep(
+            max(
+                0.5,
+                SCAN_INTERVAL
+                - elapsed
+            )
+        )
+
+
+# ============================================================
+# WATCHDOG
+# ============================================================
+
+def watchdog_loop():
+
+    while running:
+
+        time.sleep(30)
+
+        if last_scan_at:
+
+            age = (
+                time.time()
+                - last_scan_at
+            )
+
+            if age > 90:
+
+                print(
+                    "[WATCHDOG] "
+                    f"último scan há "
+                    f"{age:.0f}s"
+                )
+
+
+# ============================================================
+# FLASK
+# ============================================================
+
+@app.route("/")
+def home():
+
+    return jsonify({
+
+        "bot":
+            "Pump Hunter",
+
+        "version":
+            VERSION,
+
+        "status":
+            "running"
+            if running
+            else "stopped",
+
+        "scan_count":
+            scan_count,
+
+        "last_scan_at":
+            last_scan_at,
+
+        "last_successful_scan":
+            last_successful_scan,
+
+        "last_api_error":
+            last_api_error,
+
+        "active_observations":
+            len(
+                active_observations
+            ),
+
+        "contracts":
+            len(contracts)
+    })
+
+
+@app.route("/status")
+def status():
+
+    return jsonify({
+
+        "version":
+            VERSION,
+
+        "running":
+            running,
+
+        "scan_count":
+            scan_count,
+
+        "last_scan_at":
+            last_scan_at,
+
+        "last_successful_scan":
+            last_successful_scan,
+
+        "last_api_error":
+            last_api_error,
+
+        "active_observations":
+            len(
+                active_observations
+            ),
+
+        "contracts":
+            len(contracts),
+
+        "database":
+            DB_PATH
+    })
+
+
+# ============================================================
+# START
+# ============================================================
+
+def start():
+
+    print("=" * 60)
+
+    print(
+        f"🚀 {VERSION} iniciado"
+    )
+
+    print("=" * 60)
+
+    # Banco
+    init_db()
+
+    # Recupera sinais ainda em avaliação
+    load_pending_observations()
+
+    # Monitor
+    threading.Thread(
+        target=monitor_loop,
+        daemon=True
+    ).start()
+
+    # Watchdog
+    threading.Thread(
+        target=watchdog_loop,
+        daemon=True
+    ).start()
+
+    # Porta do Render
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000"
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
+
+
+# ============================================================
+# EXECUÇÃO
+# ============================================================
+
+if __name__ == "__main__":
+
+    start()
