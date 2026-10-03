@@ -2895,20 +2895,12 @@ def monitor_loop():
 
                 print(
                     f"[SCAN] {scan_count} | "
-                    f"Monitoradas: "
-                    f"{len(selected)}/"
-                    f"{MAX_CONTRACTS} | "
-                    f"Candidatos: "
-                    f"{len(candidates)} | "
-                    f"melhor="
-                    f"{best['symbol'] "
-                    f"if best else 'nenhuma'} | "
-                    f"BTC15="
-                    f"{market['btc15']:.2f}% | "
-                    f"BTC60="
-                    f"{market['btc60']:.2f}% | "
-                    f"regime="
-                    f"{market['regime']}"
+f"Monitoradas: {len(selected)}/{MAX_CONTRACTS} | "
+f"Candidatos: {len(candidates)} | "
+f"melhor={best['symbol'] if best else 'nenhuma'} | "
+f"BTC15={market['btc15']:.2f}% | "
+f"BTC60={market['btc60']:.2f}% | "
+f"regime={market['regime']}"
                 )
 
         except Exception as error:
