@@ -3062,8 +3062,9 @@ def start():
         daemon=True
     ).start()
 
+    # Servidor web para o Render
+    port = int(os.environ.get("PORT", 10000))
 
-port = int(os.environ.get("PORT", 10000))
     app.run(
         host="0.0.0.0",
         port=port,
@@ -3077,5 +3078,4 @@ port = int(os.environ.get("PORT", 10000))
 # ============================================================
 
 if __name__ == "__main__":
-
     start()
