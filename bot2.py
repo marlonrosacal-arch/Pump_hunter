@@ -1510,4 +1510,5 @@ def symbol_recently_alerted(symbol):
 
     return (
         time.time() - last
-        <
+        < COOLDOWN_SYMBOL
+    )
