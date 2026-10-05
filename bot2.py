@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 # V5.2 — PUMP HUNTER / FUTURES RADAR
 # ============================================================
 
-VERSION = "V5.2"
+VERSION = "V5.3"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -49,7 +49,21 @@ GAIN_TARGET = 3.0
 LOSS_TARGET = -5.0
 
 # Janela completa de avaliação
-LAB_WINDOW = 15 * 60
+LAB_WINDOW = 24 * 60 * 60
+
+# V5.3: avaliação sem limite artificial de 15 minutos.
+LAB_EXPIRY = 24 * 60 * 60
+HORIZONS = {
+    "30": 30,
+    "60": 60,
+    "180": 180,
+    "300": 300,
+    "600": 600,
+    "900": 900,
+    "1800": 1800,
+    "3600": 3600,
+}
+DIVERGENCE_LOOKBACK = 90
 
 # Históricos
 HISTORY_SECONDS = 70 * 60
@@ -100,7 +114,7 @@ db_lock = threading.Lock()
 # BANCO
 # ============================================================
 
-DB_PATH = os.getenv("ANALYTICS_DB", "pump_hunter_v52.db")
+DB_PATH = os.getenv("ANALYTICS_DB", "pump_hunter_v53.db")
 
 
 def db_connect():
@@ -280,6 +294,33 @@ def init_db():
             "outcome_at": "REAL",
             "outcome_elapsed": "REAL"
         }
+
+        columns.update({
+            "strategy": "TEXT",
+            "movement_stage": "TEXT",
+            "from_high30": "REAL",
+            "from_high60": "REAL",
+            "rsi_divergence": "TEXT",
+            "rsi_divergence_strength": "REAL",
+            "rsi_divergence_price_delta": "REAL",
+            "rsi_divergence_rsi_delta": "REAL",
+            "entry_context_json": "TEXT",
+            "ret_1800": "REAL",
+            "ret_3600": "REAL",
+            "mfe_86400": "REAL",
+            "mae_86400": "REAL",
+            "hit_05": "INTEGER DEFAULT 0",
+            "hit_10": "INTEGER DEFAULT 0",
+            "hit_15": "INTEGER DEFAULT 0",
+            "hit_20": "INTEGER DEFAULT 0",
+            "hit_30": "INTEGER DEFAULT 0",
+            "hit_05_elapsed": "REAL",
+            "hit_10_elapsed": "REAL",
+            "hit_15_elapsed": "REAL",
+            "hit_20_elapsed": "REAL",
+            "hit_30_elapsed": "REAL",
+            "signal_number": "TEXT"
+        })
 
         for name, definition in columns.items():
             if name not in existing:
@@ -811,119 +852,91 @@ def volume_ratio(history, seconds=60):
 # ESTRUTURA / ROMPIMENTO
 # ============================================================
 
+def _pivot_indices(values, left=3, right=3):
+    highs=[]
+    lows=[]
+    n=len(values)
+    for i in range(left, n-right):
+        window=values[i-left:i+right+1]
+        if values[i] == max(window):
+            highs.append(i)
+        if values[i] == min(window):
+            lows.append(i)
+    return highs, lows
+
+
+def rsi_divergence(prices, period=14, lookback=DIVERGENCE_LOOKBACK):
+    """Detecta divergência RSI regular e devolve força normalizada.
+    Bullish: preço faz fundo mais baixo e RSI fundo mais alto.
+    Bearish: preço faz topo mais alto e RSI topo mais baixo.
+    A divergência sozinha nunca dispara sinal.
+    """
+    if len(prices) < period * 3 + 10:
+        return {"type": "NONE", "strength": 0.0, "price_delta": 0.0, "rsi_delta": 0.0}
+    vals=prices[-lookback:]
+    if len(vals) < period*2+10:
+        vals=prices
+    rsis=[]
+    for i in range(period, len(vals)+1):
+        v=rsi(vals[:i], period)
+        if v is not None:
+            rsis.append(v)
+    if len(rsis) < 20:
+        return {"type":"NONE","strength":0.0,"price_delta":0.0,"rsi_delta":0.0}
+    offset=len(vals)-len(rsis)
+    highs,lows=_pivot_indices(vals,3,3)
+    # só pivôs que possuem RSI correspondente
+    lows=[i for i in lows if i>=offset and i-offset < len(rsis)]
+    highs=[i for i in highs if i>=offset and i-offset < len(rsis)]
+    result={"type":"NONE","strength":0.0,"price_delta":0.0,"rsi_delta":0.0}
+    if len(lows)>=2:
+        a,b=lows[-2],lows[-1]
+        r1,r2=rsis[a-offset],rsis[b-offset]
+        pd=(vals[b]/vals[a]-1)*100 if vals[a] else 0
+        rd=r2-r1
+        if vals[b] < vals[a] and r2 > r1 + 1.0:
+            strength=min(100.0, max(0.0, abs(pd)*8 + rd*4))
+            result={"type":"BULLISH","strength":strength,"price_delta":pd,"rsi_delta":rd}
+    if len(highs)>=2:
+        a,b=highs[-2],highs[-1]
+        r1,r2=rsis[a-offset],rsis[b-offset]
+        pd=(vals[b]/vals[a]-1)*100 if vals[a] else 0
+        rd=r2-r1
+        if vals[b] > vals[a] and r2 < r1 - 1.0:
+            strength=min(100.0, max(0.0, abs(pd)*8 + abs(rd)*4))
+            result={"type":"BEARISH","strength":strength,"price_delta":pd,"rsi_delta":rd}
+    return result
+
+
 def structure_analysis(history):
-
-    if len(history) < 120:
-        return {
-            "bull": False,
-            "bear": False,
-            "breakout": False,
-            "false_breakout": False,
-            "resistance": None,
-            "support": None,
-            "distance_resistance": 0,
-            "distance_support": 0
-        }
-
-    prices = [x[1] for x in history]
-
-    current = prices[-1]
-
-    # aproximadamente últimos 5 minutos
-    recent_5m = prices[-60:]
-
-    # aproximadamente 1 minuto
-    recent_1m = prices[-12:]
-
-    # exclui os últimos candles/ticks para definir nível
-    base = prices[-72:-12]
-
+    prices=[x[1] for x in history]
+    if len(prices)<30:
+        return {"bull":False,"bear":False,"breakout":False,"breakdown":False,"false_breakout":False,"false_breakdown":False,"resistance":None,"support":None,"distance_resistance":0,"distance_support":0}
+    current=prices[-1]
+    recent_1m=prices[-12:]
+    base=prices[-72:-12] if len(prices)>=84 else prices[:-12]
     if not base:
-        return {
-            "bull": False,
-            "bear": False,
-            "breakout": False,
-            "false_breakout": False,
-            "resistance": None,
-            "support": None,
-            "distance_resistance": 0,
-            "distance_support": 0
-        }
-
-    resistance = max(base)
-
-    support = min(base)
-
-    old_current = prices[-12]
-
-    breakout = (
-        current > resistance
-        and
-        old_current <= resistance
-    )
-
-    breakdown = (
-        current < support
-        and
-        old_current >= support
-    )
-
-    # falso rompimento:
-    # houve pico acima do nível mas preço voltou
-    max_recent = max(recent_1m)
-
-    false_breakout = (
-        max_recent > resistance
-        and
-        current < resistance * 0.997
-    )
-
-    false_breakdown = (
-        min(recent_1m) < support
-        and
-        current > support * 1.003
-    )
-
-    distance_resistance = pct_change(
-        resistance,
-        current
-    )
-
-    distance_support = pct_change(
-        support,
-        current
-    )
-
-    bull = (
-        current > ema(prices[-100:], 21)
-        if len(prices) >= 100
-        else False
-    )
-
-    bear = (
-        current <
-        ema(prices[-100:], 21)
-        if len(prices) >= 100
-        else False
-    )
-
+        base=prices[:-1]
+    resistance=max(base)
+    support=min(base)
+    old_current=prices[-13] if len(prices)>=13 else prices[0]
+    breakout=current>resistance and old_current<=resistance
+    breakdown=current<support and old_current>=support
+    max_recent=max(recent_1m)
+    min_recent=min(recent_1m)
+    false_breakout=max_recent>resistance and current<resistance*0.997
+    false_breakdown=min_recent<support and current>support*1.003
+    ema21=ema(prices[-100:],21) if len(prices)>=21 else None
+    bull=bool(ema21 is not None and current>ema21)
+    bear=bool(ema21 is not None and current<ema21)
     return {
-        "bull": bull,
-        "bear": bear,
-
-        "breakout": breakout or breakdown,
-
-        "false_breakout":
-            false_breakout or false_breakdown,
-
-        "resistance": resistance,
-        "support": support,
-
-        "distance_resistance":
-            distance_resistance,
-
-        "distance_support":
-            distance_support
+        "bull":bull,"bear":bear,
+        "breakout":bool(breakout or breakdown),
+        "breakout_up":bool(breakout),"breakdown_down":bool(breakdown),
+        "false_breakout":bool(false_breakout),"false_breakdown":bool(false_breakdown),
+        "resistance":resistance,"support":support,
+        "distance_resistance":pct_change(resistance,current),
+        "distance_support":pct_change(support,current)
     }
 
 
@@ -932,573 +945,117 @@ def structure_analysis(history):
 # ============================================================
 
 def analyze(symbol, history, ticker, market):
-
     if len(history) < 180:
         return None
-
-    prices = [x[1] for x in history]
-
-    current = prices[-1]
-
-    returns = get_returns(history)
-
-    r5 = returns["r5"]
-    r10 = returns["r10"]
-    r15 = returns["r15"]
-    r30 = returns["r30"]
-    r60 = returns["r60"]
-
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
-    accel15 = r15 - (r30 / 2)
-
-    accel5 = r5 - (r10 - r5)
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    rsi_current = rsi(prices[-120:], 14)
-
-    rsi_previous = rsi(
-        prices[-132:-12],
-        14
-    )
-
-    if rsi_current is None:
-        return None
-
-    if rsi_previous is None:
-        rsi_previous = rsi_current
-
-    rsi_delta = rsi_current - rsi_previous
-
-    # --------------------------------------------------------
-    # EMA
-    # --------------------------------------------------------
-
-    ema9 = ema(prices[-100:], 9)
-    ema21 = ema(prices[-100:], 21)
-    ema50 = ema(prices[-100:], 50)
-
-    if None in (ema9, ema21, ema50):
-        return None
-
-    # --------------------------------------------------------
-    # ESTRUTURA
-    # --------------------------------------------------------
-
-    structure = structure_analysis(history)
-
-    # --------------------------------------------------------
-    # VOLUME / OI
-    # --------------------------------------------------------
-
-    oi = oi_change(history, 60)
-
-    vol_ratio = volume_ratio(history, 60)
-
-    # --------------------------------------------------------
-    # MERCADO
-    # --------------------------------------------------------
-
-    btc15 = market["btc15"]
-    btc30 = market["btc30"]
-    btc60 = market["btc60"]
-
-    eth15 = market["eth15"]
-    eth30 = market["eth30"]
-    eth60 = market["eth60"]
-
-    # --------------------------------------------------------
-    # TENDÊNCIA
-    # --------------------------------------------------------
-
-    trend_score = 0
-
-    if current > ema9:
-        trend_score += 4
-
-    if ema9 > ema21:
-        trend_score += 5
-
-    if ema21 > ema50:
-        trend_score += 6
-
-    # --------------------------------------------------------
-    # ESTRUTURA — 20
-    # --------------------------------------------------------
-
-    structure_score = 0
-
-    if structure["bull"]:
-        structure_score += 5
-
-    if current > ema21:
-        structure_score += 4
-
-    if current > ema50:
-        structure_score += 3
-
-    if r30 > 0:
-        structure_score += 3
-
-    if r60 > 0:
-        structure_score += 2
-
-    if structure["breakout"]:
-        structure_score += 3
-
-    structure_score = min(
-        structure_score,
-        20
-    )
-
-    # --------------------------------------------------------
-    # VOLUME — 15
-    # --------------------------------------------------------
-
-    volume_score = 0
-
-    if vol_ratio >= 1.20:
-        volume_score += 5
-
-    if vol_ratio >= 1.50:
-        volume_score += 5
-
-    if vol_ratio >= 2.00:
-        volume_score += 5
-
-    volume_score = min(
-        volume_score,
-        15
-    )
-
-    # --------------------------------------------------------
-    # MOMENTUM — 10
-    # --------------------------------------------------------
-
-    momentum_score = 0
-
-    if r15 > 0.30:
-        momentum_score += 3
-
-    if r30 > 0.60:
-        momentum_score += 2
-
-    if accel15 > 0.20:
-        momentum_score += 3
-
-    if accel5 > 0.08:
-        momentum_score += 2
-
-    momentum_score = min(
-        momentum_score,
-        10
-    )
-
-    # --------------------------------------------------------
-    # OI — 15
-    # --------------------------------------------------------
-
-    oi_score = 0
-
-    if oi > 0.20:
-        oi_score += 5
-
-    if oi > 0.50:
-        oi_score += 5
-
-    if oi > 1.00:
-        oi_score += 5
-
-    # --------------------------------------------------------
-    # VOLATILIDADE — 10
-    # --------------------------------------------------------
-
-    volatility_score = 0
-
-    recent_returns = []
-
-    for i in range(
-        max(1, len(prices) - 60),
-        len(prices)
-    ):
-        if prices[i - 1] != 0:
-            recent_returns.append(
-                pct_change(
-                    prices[i - 1],
-                    prices[i]
-                )
-            )
-
-    vol = rolling_std(recent_returns)
-
-    if vol > 0.03:
-        volatility_score += 3
-
-    if vol > 0.06:
-        volatility_score += 3
-
-    if 0.01 < abs(r15) < 2.5:
-        volatility_score += 4
-
-    volatility_score = min(
-        volatility_score,
-        10
-    )
-
-    # --------------------------------------------------------
-    # MERCADO — 10
-    # --------------------------------------------------------
-
-    market_score = 0
-
-    if btc15 >= 0:
-        market_score += 2
-
-    if btc60 >= 0:
-        market_score += 2
-
-    if eth15 >= 0:
-        market_score += 2
-
-    if eth60 >= 0:
-        market_score += 2
-
-    if market["regime"] in (
-        "BULLISH",
-        "EXPANSION"
-    ):
-        market_score += 2
-
-    market_score = min(
-        market_score,
-        10
-    )
-
-    # --------------------------------------------------------
-    # ENTRADA — 5
-    # --------------------------------------------------------
-
-    entry_score = 0
-
-    if structure["breakout"]:
-        entry_score += 3
-
-    if abs(
-        structure["distance_resistance"]
-    ) < 0.8:
-        entry_score += 2
-
-    entry_score = min(
-        entry_score,
-        5
-    )
-
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
-    raw_score = (
-        structure_score
-        + min(trend_score, 15)
-        + volume_score
-        + momentum_score
-        + min(oi_score, 15)
-        + volatility_score
-        + market_score
-        + entry_score
-    )
-
-    score = raw_score
-
-    penalties = []
-
-    # BTC contra
-    if btc15 < -0.60:
-        score -= 8
-        penalties.append("BTC contra")
-
-    if btc60 < -1.50:
-        score -= 7
-        penalties.append("BTC forte queda")
-
-    # ETH contra
-    if eth15 < -0.60:
-        score -= 4
-        penalties.append("ETH contra")
-
-    # RSI excessivo
-    if rsi_current > 78:
-        score -= 10
-        penalties.append("RSI esticado")
-
-    # OI negativo
-    if oi < -0.50:
-        score -= 6
-        penalties.append("OI negativo")
-
-    # contra tendência
-    if current < ema21:
-        score -= 8
-        penalties.append("abaixo EMA21")
-
-    if ema21 < ema50:
-        score -= 6
-        penalties.append("EMA21 < EMA50")
-
-    # falso rompimento
-    if structure["false_breakout"]:
-        score -= 15
-        penalties.append("falso rompimento")
-
-    # movimento já muito esticado
-    if r30 > 2.50:
-        score -= 8
-        penalties.append("entrada esticada")
-
-    # --------------------------------------------------------
-    # DIREÇÃO
-    # --------------------------------------------------------
-
-    bullish = (
-        current > ema21
-        and r15 > 0
-        and r30 > 0
-    )
-
-    bearish = (
-        current < ema21
-        and r15 < 0
-        and r30 < 0
-    )
-
-    if not bullish and not bearish:
-        return None
-
-    side = "LONG" if bullish else "SHORT"
-
-    # --------------------------------------------------------
+    prices=[x[1] for x in history]
+    current=prices[-1]
+    returns=get_returns(history)
+    r5,r10,r15,r30,r60=(returns[k] for k in ("r5","r10","r15","r30","r60"))
+    accel15=r15-(r30/2)
+    accel5=r5-(r10-r5)
+    rsi_current=rsi(prices[-120:],14)
+    rsi_previous=rsi(prices[-132:-12],14) or rsi_current
+    if rsi_current is None: return None
+    rsi_delta=rsi_current-rsi_previous
+    ema9,ema21,ema50=ema(prices[-100:],9),ema(prices[-100:],21),ema(prices[-100:],50)
+    if None in (ema9,ema21,ema50): return None
+    structure=structure_analysis(history)
+    div=rsi_divergence(prices)
+    oi=oi_change(history,60); vol_ratio=volume_ratio(history,60)
+    btc15,btc30,btc60=market["btc15"],market["btc30"],market["btc60"]
+    eth15,eth30,eth60=market["eth15"],market["eth30"],market["eth60"]
+    # Distância do topo recente: identifica entrada tardia/exaustão.
+    high_30=max(prices[-360:]) if len(prices)>=360 else max(prices)
+    high_60=max(prices[-720:]) if len(prices)>=720 else max(prices)
+    from_high30=(current/high_30-1)*100 if high_30 else 0
+    from_high60=(current/high_60-1)*100 if high_60 else 0
+    total_move_60=(current/prices[-720]-1)*100 if len(prices)>=720 else r60
+    recovery=(current/min(prices[-180:])-1)*100 if prices[-180:] else 0
+    stage="EARLY"
+    if abs(total_move_60)>=80: stage="EXHAUSTED"
+    elif abs(total_move_60)>=35: stage="MATURE"
+    elif abs(total_move_60)>=15: stage="DEVELOPING"
+    if recovery>8 and r30<0: stage="RECOVERY"
+    # Base scores: iguais em pesos para permitir comparação LONG/SHORT.
+    trend_long=(4 if current>ema9 else 0)+(5 if ema9>ema21 else 0)+(6 if ema21>ema50 else 0)
+    trend_short=(4 if current<ema9 else 0)+(5 if ema9<ema21 else 0)+(6 if ema21<ema50 else 0)
+    structure_long=sum([5 if structure["bull"] else 0,4 if current>ema21 else 0,3 if current>ema50 else 0,3 if r30>0 else 0,2 if r60>0 else 0,3 if structure["breakout_up"] else 0])
+    structure_short=sum([5 if structure["bear"] else 0,4 if current<ema21 else 0,3 if current<ema50 else 0,3 if r30<0 else 0,2 if r60<0 else 0,3 if structure["breakdown_down"] else 0])
+    volume_score=min(15,(5 if vol_ratio>=1.2 else 0)+(5 if vol_ratio>=1.5 else 0)+(5 if vol_ratio>=2 else 0))
+    oi_score=min(15,(5 if oi>0.2 else 0)+(5 if oi>0.5 else 0)+(5 if oi>1 else 0))
+    recent_returns=[pct_change(prices[i-1],prices[i]) for i in range(max(1,len(prices)-60),len(prices)) if prices[i-1]!=0]
+    vol=rolling_std(recent_returns)
+    volatility_score=min(10,(3 if vol>0.03 else 0)+(3 if vol>0.06 else 0)+(4 if 0.01<abs(r15)<2.5 else 0))
+    market_long=(2 if btc15>=0 else 0)+(2 if btc60>=0 else 0)+(2 if eth15>=0 else 0)+(2 if eth60>=0 else 0)+(2 if market["regime"] in ("BULLISH","EXPANSION") else 0)
+    market_short=(2 if btc15<=0 else 0)+(2 if btc60<=0 else 0)+(2 if eth15<=0 else 0)+(2 if eth60<=0 else 0)+(2 if market["regime"] in ("BEARISH","EXPANSION") else 0)
+    momentum_long=min(10,(3 if r15>0.30 else 0)+(2 if r30>0.60 else 0)+(3 if accel15>0.20 else 0)+(2 if accel5>0.08 else 0))
+    momentum_short=min(10,(3 if r15<-0.30 else 0)+(2 if r30<-0.60 else 0)+(3 if accel15<-0.20 else 0)+(2 if accel5<-0.08 else 0))
+    # Entrada: separada da força do movimento.
+    entry_long=min(5,(3 if structure["breakout_up"] else 0)+(2 if abs(structure["distance_resistance"])<0.8 else 0))
+    entry_short=min(5,(3 if structure["breakdown_down"] else 0)+(2 if abs(structure["distance_support"])<0.8 else 0))
+    common={"symbol":symbol,"r5":r5,"r10":r10,"r15":r15,"r30":r30,"r60":r60,"accel15":accel15,"accel5":accel5,"rsi":rsi_current,"rsi_delta":rsi_delta,"ema9":ema9,"ema21":ema21,"ema50":ema50,"oi_change":oi,"btc15":btc15,"btc30":btc30,"btc60":btc60,"eth15":eth15,"eth30":eth30,"eth60":eth60,"volume_ratio":vol_ratio,"regime":market["regime"],"breakout":structure["breakout"],"false_breakout":structure["false_breakout"],"from_high30":from_high30,"from_high60":from_high60,"rsi_divergence":div["type"],"rsi_divergence_strength":div["strength"],"rsi_divergence_price_delta":div["price_delta"],"rsi_divergence_rsi_delta":div["rsi_delta"],"movement_stage":stage}
+    candidates=[]
+    # LONG
+    long_score=structure_long+min(trend_long,15)+volume_score+momentum_long+oi_score+volatility_score+market_long+entry_long
+    lp=[]; lr=[]
+    if btc15<-0.60: long_score-=8; lp.append("BTC contra")
+    if btc60<-1.50: long_score-=7; lp.append("BTC forte queda")
+    if eth15<-0.60: long_score-=4; lp.append("ETH contra")
+    if rsi_current>78: long_score-=10; lp.append("RSI esticado")
+    if oi<-0.50: long_score-=6; lp.append("OI negativo")
+    if current<ema21: long_score-=8; lp.append("abaixo EMA21")
+    if ema21<ema50: long_score-=6; lp.append("EMA21 < EMA50")
+    if structure["false_breakout"]: long_score-=15; lp.append("falso rompimento")
+    if r30>2.5: long_score-=8; lp.append("entrada esticada")
+    if stage in ("MATURE","EXHAUSTED") and r30>0: long_score-=10; lp.append("movimento avançado")
+    if stage=="RECOVERY" and not (div["type"]=="BULLISH" and rsi_delta>0): long_score-=8; lp.append("pullback sem confirmação")
+    if div["type"]=="BULLISH": long_score+=4; lr.append(f"Divergência RSI bullish ({div['strength']:.0f})")
+    if div["type"]=="BEARISH": long_score-=7; lp.append("divergência RSI bearish")
+    # reversal ganha pontos somente com confirmação estrutural/momentum
+    if div["type"]=="BULLISH" and rsi_delta>0 and r5>0 and current>ema9: long_score+=4; lr.append("reversão confirmada")
+    long_score=max(0,min(100,long_score))
+    if long_score>=MIN_SCORE and r5>0 and r15>0 and rsi_current>=50:
+        strategy="LONG_BREAKOUT" if structure["breakout_up"] else ("LONG_REVERSAL" if div["type"]=="BULLISH" and stage in ("RECOVERY","MATURE") else ("LONG_ACCEL" if accel15>0.20 and r15>0 else "LONG_TREND"))
+        entry=current; stop=structure["support"]*0.998 if structure["support"] else current*0.985; risk=entry-stop
+        if risk>0:
+            reasons=lr[:]
+            if structure["breakout_up"]: reasons.append("Rompimento bullish")
+            if vol_ratio>=1.2: reasons.append(f"Volume x{vol_ratio:.1f}")
+            if oi>0.2: reasons.append(f"OI +{oi:.2f}%")
+            if ema9>ema21: reasons.append("EMA9 > EMA21")
+            if accel15>0.20: reasons.append("Aceleração")
+            if btc15>=0: reasons.append("BTC alinhado")
+            candidates.append({**common,"side":"LONG","score":long_score,"raw_score":long_score,"structure_score":structure_long,"trend_score":trend_long,"volume_score":volume_score,"momentum_score":momentum_long,"oi_score":oi_score,"volatility_score":volatility_score,"market_score":market_long,"entry_score":entry_long,"entry":entry,"stop":stop,"tp1":entry+risk*1.8,"tp2":entry+risk*2.7,"rr1":1.8,"rr2":2.7,"quality":"STRONG" if long_score>=STRONG_SCORE else ("GOOD" if long_score>=82 else "OPPORTUNITY"),"strategy":strategy,"reasons":reasons,"penalties":lp})
     # SHORT
-    # --------------------------------------------------------
-
-    if side == "SHORT":
-
-        # Para esta versão o score de SHORT
-        # é uma inversão controlada do contexto.
-        #
-        # Mantemos a mesma estrutura para que
-        # o laboratório possa comparar LONG/SHORT.
-
-        score = raw_score
-
-        if btc15 > 0.60:
-            score -= 8
-            penalties.append("BTC contra SHORT")
-
-        if btc60 > 1.50:
-            score -= 7
-            penalties.append("BTC forte alta")
-
-        if eth15 > 0.60:
-            score -= 4
-            penalties.append("ETH contra SHORT")
-
-    score = max(
-        0,
-        min(100, score)
-    )
-
-    # --------------------------------------------------------
-    # VALIDAÇÃO DO SETUP
-    # --------------------------------------------------------
-
-    if score < MIN_SCORE:
-        return None
-
-    if side == "LONG":
-
-        if r5 <= 0:
-            return None
-
-        if r15 <= 0:
-            return None
-
-        if rsi_current < 50:
-            return None
-
-    else:
-
-        if r5 >= 0:
-            return None
-
-        if r15 >= 0:
-            return None
-
-        if rsi_current > 50:
-            return None
-
-    # --------------------------------------------------------
-    # ENTRADA / STOP / TP
-    # --------------------------------------------------------
-
-    resistance = structure["resistance"]
-    support = structure["support"]
-
-    if side == "LONG":
-
-        entry = current
-
-        structural_stop = (
-            support * 0.998
-            if support
-            else current * 0.985
-        )
-
-        risk = entry - structural_stop
-
-        if risk <= 0:
-            return None
-
-        tp1 = entry + risk * 1.8
-        tp2 = entry + risk * 2.7
-
-    else:
-
-        entry = current
-
-        structural_stop = (
-            resistance * 1.002
-            if resistance
-            else current * 1.015
-        )
-
-        risk = structural_stop - entry
-
-        if risk <= 0:
-            return None
-
-        tp1 = entry - risk * 1.8
-        tp2 = entry - risk * 2.7
-
-    rr1 = 1.8
-    rr2 = 2.7
-
-    if rr1 < MIN_RR:
-        return None
-
-    # --------------------------------------------------------
-    # QUALIDADE
-    # --------------------------------------------------------
-
-    if score >= STRONG_SCORE:
-        quality = "STRONG"
-
-    elif score >= 82:
-        quality = "GOOD"
-
-    else:
-        quality = "OPPORTUNITY"
-
-    # --------------------------------------------------------
-    # MOTIVOS
-    # --------------------------------------------------------
-
-    reasons = []
-
-    if structure["breakout"]:
-        reasons.append("Rompimento")
-
-    if vol_ratio >= 1.20:
-        reasons.append(
-            f"Volume x{vol_ratio:.1f}"
-        )
-
-    if oi > 0.20:
-        reasons.append(
-            f"OI +{oi:.2f}%"
-        )
-
-    if ema9 > ema21:
-        reasons.append("EMA9 > EMA21")
-
-    if ema21 > ema50:
-        reasons.append("EMA21 > EMA50")
-
-    if accel15 > 0.20:
-        reasons.append("Aceleração")
-
-    if btc15 >= 0:
-        reasons.append("BTC alinhado")
-
-    if eth15 >= 0:
-        reasons.append("ETH alinhado")
-
-    return {
-        "symbol": symbol,
-        "side": side,
-
-        "score": round(score, 1),
-        "raw_score": round(raw_score, 1),
-
-        "structure_score": structure_score,
-        "trend_score": min(trend_score, 15),
-        "volume_score": volume_score,
-        "momentum_score": momentum_score,
-        "oi_score": min(oi_score, 15),
-        "volatility_score": volatility_score,
-        "market_score": market_score,
-        "entry_score": entry_score,
-
-        "entry": entry,
-        "stop": structural_stop,
-        "tp1": tp1,
-        "tp2": tp2,
-
-        "rr1": rr1,
-        "rr2": rr2,
-
-        "quality": quality,
-
-        "r5": r5,
-        "r10": r10,
-        "r15": r15,
-        "r30": r30,
-        "r60": r60,
-
-        "accel15": accel15,
-        "accel5": accel5,
-
-        "rsi": rsi_current,
-        "rsi_delta": rsi_delta,
-
-        "ema9": ema9,
-        "ema21": ema21,
-        "ema50": ema50,
-
-        "oi_change": oi,
-
-        "btc15": btc15,
-        "btc30": btc30,
-        "btc60": btc60,
-
-        "eth15": eth15,
-        "eth30": eth30,
-        "eth60": eth60,
-
-        "volume_ratio": vol_ratio,
-
-        "breakout": structure["breakout"],
-        "false_breakout": structure["false_breakout"],
-
-        "regime": market["regime"],
-
-        "reasons": reasons,
-        "penalties": penalties
-    }
+    short_score=structure_short+min(trend_short,15)+volume_score+momentum_short+oi_score+volatility_score+market_short+entry_short
+    sp=[]; sr=[]
+    if btc15>0.60: short_score-=8; sp.append("BTC contra SHORT")
+    if btc60>1.50: short_score-=7; sp.append("BTC forte alta")
+    if eth15>0.60: short_score-=4; sp.append("ETH contra SHORT")
+    if rsi_current<22: short_score-=4; sp.append("RSI muito baixo")
+    if oi<-0.50: short_score-=6; sp.append("OI negativo")
+    if current>ema21: short_score-=8; sp.append("acima EMA21")
+    if ema21>ema50: short_score-=6; sp.append("EMA21 > EMA50")
+    if structure["false_breakdown"]: short_score-=15; sp.append("falso breakdown")
+    if r30<-2.5: short_score-=8; sp.append("SHORT esticado")
+    if div["type"]=="BEARISH": short_score+=5; sr.append(f"Divergência RSI bearish ({div['strength']:.0f})")
+    if div["type"]=="BULLISH": short_score-=7; sp.append("divergência RSI bullish")
+    if stage=="EXHAUSTED" and div["type"]!="BEARISH": short_score-=5; sp.append("alta exausta sem divergência")
+    if div["type"]=="BEARISH" and rsi_delta<0 and r5<0 and current<ema9: short_score+=4; sr.append("reversão bearish confirmada")
+    short_score=max(0,min(100,short_score))
+    if short_score>=MIN_SCORE and r5<0 and r15<0 and rsi_current<=50:
+        strategy="SHORT_BREAKDOWN" if structure["breakdown_down"] else ("SHORT_REVERSAL" if div["type"]=="BEARISH" and stage in ("RECOVERY","MATURE","EXHAUSTED") else ("SHORT_REJECTION" if div["type"]=="BEARISH" or structure["false_breakout"] else "SHORT_TREND"))
+        entry=current; stop=structure["resistance"]*1.002 if structure["resistance"] else current*1.015; risk=stop-entry
+        if risk>0:
+            reasons=sr[:]
+            if structure["breakdown_down"]: reasons.append("Breakdown bearish")
+            if structure["false_breakout"]: reasons.append("Rejeição/falso rompimento")
+            if vol_ratio>=1.2: reasons.append(f"Volume x{vol_ratio:.1f}")
+            if oi>0.2: reasons.append(f"OI +{oi:.2f}%")
+            if ema9<ema21: reasons.append("EMA9 < EMA21")
+            candidates.append({**common,"side":"SHORT","score":short_score,"raw_score":short_score,"structure_score":structure_short,"trend_score":trend_short,"volume_score":volume_score,"momentum_score":momentum_short,"oi_score":oi_score,"volatility_score":volatility_score,"market_score":market_short,"entry_score":entry_short,"entry":entry,"stop":stop,"tp1":entry-risk*1.8,"tp2":entry-risk*2.7,"rr1":1.8,"rr2":2.7,"quality":"STRONG" if short_score>=STRONG_SCORE else ("GOOD" if short_score>=82 else "OPPORTUNITY"),"strategy":strategy,"reasons":reasons,"penalties":sp})
+    if not candidates: return None
+    return max(candidates,key=lambda c:(c["score"],c["entry_score"],c["volume_ratio"],abs(c["r15"])))
 
 
 # ============================================================
@@ -1518,189 +1075,32 @@ def symbol_recently_alerted(symbol):
 # ============================================================
 
 def register_signal(candidate, detected_at):
-
-    symbol = candidate["symbol"]
-
+    symbol=candidate["symbol"]
     if symbol_recently_alerted(symbol):
         return None
-
     with db_lock:
-        conn = db_connect()
-
-        cur = conn.execute("""
-        INSERT INTO signals (
-            detected_at,
-            detected_at_str,
-            symbol,
-            side,
-            alert_sent,
-            alert_sent_at,
-
-            entry_price,
-            stop_price,
-            tp1_price,
-            tp2_price,
-
-            score,
-            raw_score,
-
-            structure_score,
-            trend_score,
-            volume_score,
-            momentum_score,
-            oi_score,
-            volatility_score,
-            market_score,
-            entry_score,
-
-            r5,
-            r10,
-            r15,
-            r30,
-            r60,
-
-            accel_15,
-            accel_5,
-
-            rsi,
-            rsi_delta,
-
-            ema9,
-            ema21,
-            ema50,
-
-            oi_change,
-
-            btc15,
-            btc30,
-            btc60,
-
-            eth15,
-            eth30,
-            eth60,
-
-            volume_ratio,
-
-            breakout,
-            false_breakout,
-
-            setup_quality,
-            reasons
-        )
-        VALUES (
-            ?,?,?,?,?,?,
-            ?,?,?,?,
-            ?,?,
-            ?,?,?,?,?,?,?,?,
-            ?,?,?,?,?,
-            ?,?,
-            ?,?,
-            ?,?,?,
-            ?,
-            ?,?,?,
-            ?,?,?,
-            ?,
-            ?,?,
-            ?,?
-        )
-        """, (
-            detected_at,
-            datetime.fromtimestamp(
-                detected_at,
-                timezone.utc
-            ).isoformat(),
-
-            symbol,
-            candidate["side"],
-
-            1,
-            time.time(),
-
-            candidate["entry"],
-            candidate["stop"],
-            candidate["tp1"],
-            candidate["tp2"],
-
-            candidate["score"],
-            candidate["raw_score"],
-
-            candidate["structure_score"],
-            candidate["trend_score"],
-            candidate["volume_score"],
-            candidate["momentum_score"],
-            candidate["oi_score"],
-            candidate["volatility_score"],
-            candidate["market_score"],
-            candidate["entry_score"],
-
-            candidate["r5"],
-            candidate["r10"],
-            candidate["r15"],
-            candidate["r30"],
-            candidate["r60"],
-
-            candidate["accel15"],
-            candidate["accel5"],
-
-            candidate["rsi"],
-            candidate["rsi_delta"],
-
-            candidate["ema9"],
-            candidate["ema21"],
-            candidate["ema50"],
-
-            candidate["oi_change"],
-
-            candidate["btc15"],
-            candidate["btc30"],
-            candidate["btc60"],
-
-            candidate["eth15"],
-            candidate["eth30"],
-            candidate["eth60"],
-
-            candidate["volume_ratio"],
-
-            int(candidate["breakout"]),
-            int(candidate["false_breakout"]),
-
-            candidate["quality"],
-
-            json.dumps({
-                "reasons": candidate["reasons"],
-                "penalties": candidate["penalties"]
-            }, ensure_ascii=False)
-        ))
-
-        signal_id = cur.lastrowid
-
-        conn.commit()
-        conn.close()
-
-    last_alert_symbol[symbol] = time.time()
-
-    active_observations[signal_id] = {
-        "id": signal_id,
-        "symbol": symbol,
-        "side": candidate["side"],
-        "entry": candidate["entry"],
-        "detected_at": detected_at,
-
-        "max_fav": 0.0,
-        "max_adv": 0.0,
-
-        "mfe_at": detected_at,
-        "mfe_elapsed": 0.0,
-
-        "mae_at": detected_at,
-        "mae_elapsed": 0.0,
-
-        "outcome": None,
-        "outcome_at": None,
-        "outcome_elapsed": None
-    }
-
+        conn=db_connect()
+        cur=conn.execute("""
+        INSERT INTO signals (detected_at,detected_at_str,symbol,side,alert_sent,alert_sent_at,entry_price,stop_price,tp1_price,tp2_price,score,raw_score,structure_score,trend_score,volume_score,momentum_score,oi_score,volatility_score,market_score,entry_score,r5,r10,r15,r30,r60,accel_15,accel_5,rsi,rsi_delta,ema9,ema21,ema50,oi_change,btc15,btc30,btc60,eth15,eth30,eth60,volume_ratio,from_high30,from_high60,breakout,false_breakout,setup_quality,reasons) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,(detected_at,datetime.fromtimestamp(detected_at,timezone.utc).isoformat(),symbol,candidate["side"],0,None,candidate["entry"],candidate["stop"],candidate["tp1"],candidate["tp2"],candidate["score"],candidate["raw_score"],candidate["structure_score"],candidate["trend_score"],candidate["volume_score"],candidate["momentum_score"],candidate["oi_score"],candidate["volatility_score"],candidate["market_score"],candidate["entry_score"],candidate["r5"],candidate["r10"],candidate["r15"],candidate["r30"],candidate["r60"],candidate["accel15"],candidate["accel5"],candidate["rsi"],candidate["rsi_delta"],candidate["ema9"],candidate["ema21"],candidate["ema50"],candidate["oi_change"],candidate["btc15"],candidate["btc30"],candidate["btc60"],candidate["eth15"],candidate["eth30"],candidate["eth60"],candidate["volume_ratio"],candidate["from_high30"],candidate["from_high60"],int(candidate["breakout"]),int(candidate["false_breakout"]),candidate["quality"],json.dumps({"reasons":candidate["reasons"],"penalties":candidate["penalties"]},ensure_ascii=False)))
+        signal_id=cur.lastrowid
+        context={k:candidate.get(k) for k in ("strategy","movement_stage","rsi_divergence","rsi_divergence_strength","rsi_divergence_price_delta","rsi_divergence_rsi_delta","regime","btc15","btc30","btc60","eth15","eth30","eth60","ema9","ema21","ema50","rsi","rsi_delta","r5","r10","r15","r30","r60","accel15","accel5","volume_ratio","oi_change","from_high30","from_high60","score","raw_score","structure_score","trend_score","volume_score","momentum_score","oi_score","volatility_score","market_score","entry_score","entry","stop","tp1","tp2","rr1","rr2")}
+        conn.execute("UPDATE signals SET signal_number=?,strategy=?,movement_stage=?,rsi_divergence=?,rsi_divergence_strength=?,rsi_divergence_price_delta=?,rsi_divergence_rsi_delta=?,entry_context_json=? WHERE id=?",(f"SINAL #{signal_id:06d}",candidate.get("strategy"),candidate.get("movement_stage"),candidate.get("rsi_divergence"),candidate.get("rsi_divergence_strength"),candidate.get("rsi_divergence_price_delta"),candidate.get("rsi_divergence_rsi_delta"),json.dumps(context,ensure_ascii=False),signal_id))
+        conn.commit(); conn.close()
+    active_observations[signal_id]={"id":signal_id,"symbol":symbol,"side":candidate["side"],"entry":candidate["entry"],"detected_at":detected_at,"max_fav":0.0,"max_adv":0.0,"mfe_at":detected_at,"mfe_elapsed":0.0,"mae_at":detected_at,"mae_elapsed":0.0,"outcome":None,"outcome_at":None,"outcome_elapsed":None,"hits":{"0.5":None,"1.0":None,"1.5":None,"2.0":None,"3.0":None}}
+    last_alert_symbol[symbol]=time.time()
     return signal_id
+
+
+def mark_alert_sent(signal_id):
+    with db_lock:
+        conn=db_connect(); conn.execute("UPDATE signals SET alert_sent=1,alert_sent_at=? WHERE id=?",(time.time(),signal_id)); conn.commit(); conn.close()
+
+
+def discard_signal(signal_id):
+    active_observations.pop(signal_id,None)
+    with db_lock:
+        conn=db_connect(); conn.execute("DELETE FROM signals WHERE id=?",(signal_id,)); conn.commit(); conn.close()
 
 
 # ============================================================
@@ -1728,205 +1128,40 @@ def side_return(side, entry, price):
 # ============================================================
 
 def update_active_observations(tickers, now):
-
-    prices = {
-        x["symbol"]: x["price"]
-        for x in tickers
-    }
-
-    finished = []
-
-    for signal_id, obs in list(
-        active_observations.items()
-    ):
-
-        price = prices.get(
-            obs["symbol"]
-        )
-
-        if price is None:
-            continue
-
-        elapsed = (
-            now - obs["detected_at"]
-        )
-
-        ret = side_return(
-            obs["side"],
-            obs["entry"],
-            price
-        )
-
-        # ----------------------------------------------------
-        # MFE
-        # ----------------------------------------------------
-
-        if ret > obs["max_fav"]:
-
-            obs["max_fav"] = ret
-
-            obs["mfe_at"] = now
-
-            obs["mfe_elapsed"] = elapsed
-
-        # ----------------------------------------------------
-        # MAE
-        # ----------------------------------------------------
-
-        if ret < obs["max_adv"]:
-
-            obs["max_adv"] = ret
-
-            obs["mae_at"] = now
-
-            obs["mae_elapsed"] = elapsed
-
-        # ----------------------------------------------------
-        # RESULTADO
-        # ----------------------------------------------------
-
+    prices={x["symbol"]:x["price"] for x in tickers}
+    for signal_id,obs in list(active_observations.items()):
+        price=prices.get(obs["symbol"])
+        if price is None: continue
+        elapsed=now-obs["detected_at"]
+        ret=side_return(obs["side"],obs["entry"],price)
+        if ret>obs["max_fav"]: obs["max_fav"]=ret; obs["mfe_at"]=now; obs["mfe_elapsed"]=elapsed
+        if ret<obs["max_adv"]: obs["max_adv"]=ret; obs["mae_at"]=now; obs["mae_elapsed"]=elapsed
+        for threshold,key in ((0.5,"05"),(1.0,"10"),(1.5,"15"),(2.0,"20"),(3.0,"30")):
+            if obs["hits"].get(key) is None and ret>=threshold:
+                obs["hits"][key]=elapsed
         if obs["outcome"] is None:
-
-            if ret >= GAIN_TARGET:
-
-                obs["outcome"] = "GAIN"
-
-                obs["outcome_at"] = now
-
-                obs["outcome_elapsed"] = elapsed
-
-            elif ret <= LOSS_TARGET:
-
-                obs["outcome"] = "LOSS"
-
-                obs["outcome_at"] = now
-
-                obs["outcome_elapsed"] = elapsed
-
-        # ----------------------------------------------------
-        # HORIZONTES
-        # ----------------------------------------------------
-
-        fields = {}
-
-        if elapsed >= 30:
-            fields["ret_30"] = ret
-
-        if elapsed >= 60:
-            fields["ret_60"] = ret
-
-        if elapsed >= 180:
-            fields["ret_180"] = ret
-
-        if elapsed >= 300:
-            fields["ret_300"] = ret
-
-        if elapsed >= 600:
-            fields["ret_600"] = ret
-
-        if elapsed >= 900:
-            fields["ret_900"] = ret
-
-        # ----------------------------------------------------
-        # FINAL DOS 15 MINUTOS
-        # ----------------------------------------------------
-
-        if elapsed >= LAB_WINDOW:
-
-            if obs["outcome"] is None:
-
-                obs["outcome"] = "NEUTRAL"
-
-                obs["outcome_at"] = now
-
-                obs["outcome_elapsed"] = LAB_WINDOW
-
-            fields.update({
-
-                "mfe_900":
-                    obs["max_fav"],
-
-                "mae_900":
-                    obs["max_adv"],
-
-                "max_fav":
-                    obs["max_fav"],
-
-                "max_adv":
-                    obs["max_adv"],
-
-                "mfe_at":
-                    obs["mfe_at"],
-
-                "mfe_elapsed":
-                    obs["mfe_elapsed"],
-
-                "mae_at":
-                    obs["mae_at"],
-
-                "mae_elapsed":
-                    obs["mae_elapsed"],
-
-                "outcome":
-                    obs["outcome"],
-
-                "outcome_at":
-                    obs["outcome_at"],
-
-                "outcome_elapsed":
-                    obs["outcome_elapsed"],
-
-                "complete":
-                    1,
-
-                "completed_at":
-                    now
-            })
-
-            finished.append(
-                signal_id
-            )
-
-        # ----------------------------------------------------
-        # SALVA NO BANCO
-        # ----------------------------------------------------
-
+            if ret>=GAIN_TARGET:
+                obs["outcome"]="GAIN"; obs["outcome_at"]=now; obs["outcome_elapsed"]=elapsed
+            elif ret<=LOSS_TARGET:
+                obs["outcome"]="LOSS"; obs["outcome_at"]=now; obs["outcome_elapsed"]=elapsed
+            elif elapsed>=LAB_EXPIRY:
+                obs["outcome"]="EXPIRED"; obs["outcome_at"]=now; obs["outcome_elapsed"]=elapsed
+        fields={}
+        for key,seconds in HORIZONS.items():
+            if elapsed>=seconds: fields[f"ret_{key}"]=ret
+        if elapsed>=LAB_EXPIRY:
+            fields.update({"mfe_86400":obs["max_fav"],"mae_86400":obs["max_adv"],"max_fav":obs["max_fav"],"max_adv":obs["max_adv"],"mfe_at":obs["mfe_at"],"mfe_elapsed":obs["mfe_elapsed"],"mae_at":obs["mae_at"],"mae_elapsed":obs["mae_elapsed"],"outcome":obs["outcome"],"outcome_at":obs["outcome_at"],"outcome_elapsed":obs["outcome_elapsed"],"complete":1,"completed_at":now})
+        for key,col in (("05","hit_05"),("10","hit_10"),("15","hit_15"),("20","hit_20"),("30","hit_30")):
+            if obs["hits"].get(key) is not None: fields[col]=1; fields[f"{col}_elapsed"]=obs["hits"][key]
         if fields:
-
-            assignments = ", ".join(
-                f"{key}=?"
-                for key in fields
-            )
-
             with db_lock:
+                conn=db_connect(); assignments=", ".join(f"{k}=?" for k in fields); conn.execute(f"UPDATE signals SET {assignments} WHERE id=?",(*fields.values(),signal_id)); conn.commit(); conn.close()
+        if obs["outcome"] is not None and obs["outcome"] in ("GAIN","LOSS"):
+            # continua coletando até 24h para MFE/MAE e horizontes; só remove no expiry.
+            pass
+        if elapsed>=LAB_EXPIRY:
+            active_observations.pop(signal_id,None)
 
-                conn = db_connect()
-
-                conn.execute(
-                    f"""
-                    UPDATE signals
-                    SET {assignments}
-                    WHERE id=?
-                    """,
-                    (
-                        *fields.values(),
-                        signal_id
-                    )
-                )
-
-                conn.commit()
-                conn.close()
-
-    # --------------------------------------------------------
-    # REMOVE FINALIZADOS DA MEMÓRIA
-    # --------------------------------------------------------
-
-    for signal_id in finished:
-
-        active_observations.pop(
-            signal_id,
-            None
-        )
 
 
 # ============================================================
@@ -1939,7 +1174,7 @@ def load_pending_observations():
 
     cutoff = (
         time.time()
-        - LAB_WINDOW
+        - LAB_EXPIRY
         - 300
     )
 
@@ -1966,7 +1201,8 @@ def load_pending_observations():
 
             outcome,
             outcome_at,
-            outcome_elapsed
+            outcome_elapsed,
+            hit_05_elapsed, hit_10_elapsed, hit_15_elapsed, hit_20_elapsed, hit_30_elapsed
 
         FROM signals
 
@@ -2028,8 +1264,10 @@ def load_pending_observations():
             "outcome_at":
                 row["outcome_at"],
 
-            "outcome_elapsed":
-                row["outcome_elapsed"]
+            "outcome_elapsed": row["outcome_elapsed"],
+            "hits": {
+                "05": row["hit_05_elapsed"], "10": row["hit_10_elapsed"], "15": row["hit_15_elapsed"], "20": row["hit_20_elapsed"], "30": row["hit_30_elapsed"]
+            }
         }
 
 
@@ -2059,7 +1297,7 @@ def completed_rows_after(
         AND outcome IN (
             'GAIN',
             'LOSS',
-            'NEUTRAL'
+            'EXPIRED'
         )
 
         ORDER BY id ASC
@@ -2097,7 +1335,7 @@ def completed_since(seconds):
         AND outcome IN (
             'GAIN',
             'LOSS',
-            'NEUTRAL'
+            'EXPIRED'
         )
 
         AND completed_at >= ?
@@ -2133,9 +1371,9 @@ def report_metrics(rows):
         if r["outcome"] == "LOSS"
     ]
 
-    neutral = [
+    expired = [
         r for r in rows
-        if r["outcome"] == "NEUTRAL"
+        if r["outcome"] == "EXPIRED"
     ]
 
     def average(
@@ -2168,8 +1406,8 @@ def report_metrics(rows):
         "loss":
             len(losses),
 
-        "neutral":
-            len(neutral),
+        "expired":
+            len(expired),
 
         "gain_pct":
             len(gains)
@@ -2181,22 +1419,14 @@ def report_metrics(rows):
             / total
             * 100,
 
-        "neutral_pct":
-            len(neutral)
+        "expired_pct":
+            len(expired)
             / total
             * 100,
 
-        "mfe":
-            average(
-                "mfe_900",
-                rows
-            ),
+        "mfe": average("mfe_900", rows),
 
-        "mae":
-            average(
-                "mae_900",
-                rows
-            ),
+        "mae": average("mae_900", rows),
 
         "ret5":
             average(
@@ -2216,11 +1446,11 @@ def report_metrics(rows):
                 gains
             ),
 
-        "loss_time":
-            average(
-                "outcome_elapsed",
-                losses
-            )
+        "loss_time": average("outcome_elapsed", losses),
+        "expired_time": average("outcome_elapsed", expired),
+        "hit_rates": {k: (sum(1 for r in rows if r[f"hit_{k}"]) / total * 100) for k in ("05","10","15","20","30")},
+        "ret30m": average("ret_1800", rows),
+        "ret60m": average("ret_3600", rows)
     }
 
 
@@ -2284,10 +1514,14 @@ def bucket_lines(rows):
 
         (
             "Volume >= 1.5x",
-            lambda r:
-                (r["volume_ratio"] or 0)
-                >= 1.5
-        )
+            lambda r: (r["volume_ratio"] or 0) >= 1.5
+        ),
+        ("Divergência RSI bullish", lambda r: r["rsi_divergence"] == "BULLISH"),
+        ("Divergência RSI bearish", lambda r: r["rsi_divergence"] == "BEARISH"),
+        ("LONG_REVERSAL", lambda r: r["strategy"] == "LONG_REVERSAL"),
+        ("SHORT_REVERSAL", lambda r: r["strategy"] == "SHORT_REVERSAL"),
+        ("Entrada avançada", lambda r: r["movement_stage"] in ("MATURE","EXHAUSTED")),
+        ("Pullback/Recovery", lambda r: r["movement_stage"] == "RECOVERY")
     ]
 
     output = []
@@ -2357,14 +1591,11 @@ def build_report(
         f"*{metrics['loss']} "
         f"({metrics['loss_pct']:.1f}%)*",
 
-        f"🟡 NEUTRAL: "
-        f"*{metrics['neutral']} "
-        f"({metrics['neutral_pct']:.1f}%)*",
+        f"⚪ EXPIRED: *{metrics['expired']} ({metrics['expired_pct']:.1f}%)*",
 
         "",
 
-        f"MFE médio 15m: "
-        f"*{metrics['mfe']:.2f}%*",
+        f"MFE médio 15m: *{metrics['mfe']:.2f}%*",
 
         f"MAE médio 15m: "
         f"*{metrics['mae']:.2f}%*",
@@ -2372,8 +1603,13 @@ def build_report(
         f"Retorno médio 5m: "
         f"*{metrics['ret5']:.2f}%*",
 
-        f"Retorno médio 15m: "
-        f"*{metrics['ret15']:.2f}%*",
+        f"Retorno médio 15m: *{metrics['ret15']:.2f}%*",
+        f"Retorno médio 30m: *{metrics['ret30m']:.2f}%*",
+        f"Retorno médio 60m: *{metrics['ret60m']:.2f}%*",
+        "",
+        "🎯 *Hits antes do desfecho:*",
+        f"+0,5%: {metrics['hit_rates']['05']:.1f}% | +1%: {metrics['hit_rates']['10']:.1f}%",
+        f"+1,5%: {metrics['hit_rates']['15']:.1f}% | +2%: {metrics['hit_rates']['20']:.1f}% | +3%: {metrics['hit_rates']['30']:.1f}%",
 
         f"Tempo médio GAIN: "
         f"*{metrics['gain_time']/60:.1f} min*",
@@ -2438,7 +1674,7 @@ def maybe_send_reports():
         ]
 
         title = (
-            "V5.2 — BLOCO "
+            "V5.3 — BLOCO "
             f"{block[0]['id']}-"
             f"{block[-1]['id']}"
         )
@@ -2477,7 +1713,7 @@ def maybe_send_reports():
 
         if send_telegram(
             build_report(
-                "V5.2 — RELATÓRIO SEMANAL",
+                "V5.3 — RELATÓRIO SEMANAL",
                 weekly_rows
             )
         ):
@@ -2492,7 +1728,7 @@ def maybe_send_reports():
 # ALERTA TELEGRAM
 # ============================================================
 
-def format_alert(candidate):
+def format_alert(candidate, signal_id=None):
 
     side = candidate["side"]
 
@@ -2519,8 +1755,11 @@ def format_alert(candidate):
 
     message = [
 
-        f"{icon} *{side} — "
-        f"{candidate['symbol']}*",
+        f"{icon} *{side} — {candidate['symbol']}*",
+        "",
+        (f"🚨 *SINAL #{signal_id:06d}*" if signal_id else "🚨 *SINAL — PENDENTE*"),
+        f"*Estratégia:* {candidate.get('strategy','N/A')}",
+        f"*Estágio:* {candidate.get('movement_stage','N/A')}",
 
         "",
 
@@ -2557,8 +1796,9 @@ def format_alert(candidate):
 
         "",
 
+        f"*Divergência RSI:* {candidate.get('rsi_divergence','NONE')} ({candidate.get('rsi_divergence_strength',0):.0f}/100)",
+        "",
         "*Motivos:*",
-
         reasons
     ]
 
@@ -2853,33 +2093,17 @@ def monitor_loop():
                 >= ALERT_INTERVAL
             ):
 
-                message = format_alert(
-                    best
-                )
-
-                sent = send_telegram(
-                    message
-                )
-
-                if sent:
-
-                    signal_id = register_signal(
-                        best,
-                        time.time()
-                    )
-
-                    if signal_id:
-
-                        last_alert_global_local = (
-                            time.time()
-                        )
-
-                        print(
-                            "[ALERT]",
-                            best["side"],
-                            best["symbol"],
-                            f"score={best['score']:.0f}"
-                        )
+                detected_at=time.time()
+                signal_id=register_signal(best, detected_at)
+                if signal_id:
+                    message=format_alert(best, signal_id)
+                    sent=send_telegram(message)
+                    if sent:
+                        mark_alert_sent(signal_id)
+                        last_alert_global_local=time.time()
+                        print("[ALERT]", best["side"], best["symbol"], f"#{signal_id:06d}", f"score={best['score']:.0f}")
+                    else:
+                        discard_signal(signal_id)
 
             # ------------------------------------------------
             # RELATÓRIOS
