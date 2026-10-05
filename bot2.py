@@ -1054,8 +1054,37 @@ def analyze(symbol, history, ticker, market):
             if oi>0.2: reasons.append(f"OI +{oi:.2f}%")
             if ema9<ema21: reasons.append("EMA9 < EMA21")
             candidates.append({**common,"side":"SHORT","score":short_score,"raw_score":short_score,"structure_score":structure_short,"trend_score":trend_short,"volume_score":volume_score,"momentum_score":momentum_short,"oi_score":oi_score,"volatility_score":volatility_score,"market_score":market_short,"entry_score":entry_short,"entry":entry,"stop":stop,"tp1":entry-risk*1.8,"tp2":entry-risk*2.7,"rr1":1.8,"rr2":2.7,"quality":"STRONG" if short_score>=STRONG_SCORE else ("GOOD" if short_score>=82 else "OPPORTUNITY"),"strategy":strategy,"reasons":reasons,"penalties":sp})
-    if not candidates: return None
-    return max(candidates,key=lambda c:(c["score"],c["entry_score"],c["volume_ratio"],abs(c["r15"])))
+    if candidates:
+        best_candidate=max(candidates,key=lambda c:(c["score"],c["entry_score"],c["volume_ratio"],abs(c["r15"])))
+        best_candidate["eligible"] = True
+        return best_candidate
+
+    # Diagnóstico: devolve o melhor lado mesmo abaixo do limiar,
+    # mas marcado como inelegível para que o monitor possa mostrar
+    # por que os sinais estão ficando de fora sem gerar alerta.
+    if long_score >= short_score:
+        diagnostic_side = "LONG"
+        diagnostic_score = long_score
+        diagnostic_penalties = lp
+        diagnostic_strategy = "LONG_DIAGNOSTIC"
+    else:
+        diagnostic_side = "SHORT"
+        diagnostic_score = short_score
+        diagnostic_penalties = sp
+        diagnostic_strategy = "SHORT_DIAGNOSTIC"
+
+    return {
+        **common,
+        "side": diagnostic_side,
+        "score": diagnostic_score,
+        "raw_score": diagnostic_score,
+        "entry_score": entry_long if diagnostic_side == "LONG" else entry_short,
+        "quality": "BELOW_THRESHOLD",
+        "strategy": diagnostic_strategy,
+        "reasons": [],
+        "penalties": diagnostic_penalties,
+        "eligible": False,
+    }
 
 
 # ============================================================
@@ -2033,6 +2062,7 @@ def monitor_loop():
             market = market_context()
 
             candidates = []
+            diagnostic_candidates = []
 
             # ------------------------------------------------
             # ANALISA MOEDAS
@@ -2065,10 +2095,10 @@ def monitor_loop():
                 )
 
                 if candidate:
+                    diagnostic_candidates.append(candidate)
 
-                    candidates.append(
-                        candidate
-                    )
+                    if candidate.get("eligible", False):
+                        candidates.append(candidate)
 
             # ------------------------------------------------
             # MELHOR OPORTUNIDADE
@@ -2119,13 +2149,36 @@ def monitor_loop():
 
                 print(
                     f"[SCAN] {scan_count} | "
-f"Monitoradas: {len(selected)}/{MAX_CONTRACTS} | "
-f"Candidatos: {len(candidates)} | "
-f"melhor={best['symbol'] if best else 'nenhuma'} | "
-f"BTC15={market['btc15']:.2f}% | "
-f"BTC60={market['btc60']:.2f}% | "
-f"regime={market['regime']}"
+                    f"Monitoradas: {len(selected)}/{MAX_CONTRACTS} | "
+                    f"Candidatos: {len(candidates)} | "
+                    f"melhor={best['symbol'] if best else 'nenhuma'} | "
+                    f"BTC15={market['btc15']:.2f}% | "
+                    f"BTC60={market['btc60']:.2f}% | "
+                    f"regime={market['regime']}"
                 )
+
+                # Diagnóstico dos melhores quase-sinais. Não gera alerta.
+                top_diag = sorted(
+                    diagnostic_candidates,
+                    key=lambda c: (c["score"], c.get("volume_ratio", 0), abs(c.get("r15", 0))),
+                    reverse=True
+                )[:3]
+
+                if top_diag:
+                    for d in top_diag:
+                        penalties = ", ".join(d.get("penalties", [])[:3]) or "sem penalizações fortes"
+                        print(
+                            f"[TOP] {d['symbol']} {d['side']} "
+                            f"score={d['score']:.0f} "
+                            f"RSI={d.get('rsi', 0):.1f} "
+                            f"r5={d.get('r5', 0):+.2f}% "
+                            f"r15={d.get('r15', 0):+.2f}% "
+                            f"VOL=x{d.get('volume_ratio', 0):.1f} "
+                            f"OI={d.get('oi_change', 0):+.2f}% "
+                            f"stage={d.get('movement_stage', '?')} "
+                            f"div={d.get('rsi_divergence', 'NONE')} "
+                            f"| {penalties}"
+                        )
 
         except Exception as error:
 
