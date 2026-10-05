@@ -1900,6 +1900,8 @@ def choose_best(
 
 def monitor_loop():
 
+    print("[MONITOR] loop iniciado", flush=True)
+
     global last_scan_at
     global last_successful_scan
     global scan_count
@@ -1912,6 +1914,7 @@ def monitor_loop():
     while running:
 
         started = time.time()
+        print(f"[LOOP] início ciclo | scan={scan_count + 1}", flush=True)
 
         last_scan_at = started
 
@@ -1929,15 +1932,20 @@ def monitor_loop():
                 >= CONTRACT_REFRESH
             ):
 
-                refresh_contracts()
+                refreshed = refresh_contracts()
 
                 last_contract_refresh = started
+
+                if not refreshed:
+                    print("[CONTRACTS] refresh falhou; continuando com o ciclo", flush=True)
 
             # ------------------------------------------------
             # TICKERS
             # ------------------------------------------------
 
             tickers = get_all_tickers()
+
+            print(f"[TICKERS] recebidos={len(tickers)}", flush=True)
 
             if not tickers:
 
@@ -2145,7 +2153,7 @@ def monitor_loop():
             # LOG
             # ------------------------------------------------
 
-            if scan_count % 12 == 0:
+            if True:
 
                 print(
                     f"[SCAN] {scan_count} | "
@@ -2179,6 +2187,8 @@ def monitor_loop():
                             f"div={d.get('rsi_divergence', 'NONE')} "
                             f"| {penalties}"
                         )
+
+            print(f"[LOOP] fim ciclo | scan={scan_count} | candidatos={len(candidates)} | demorou={time.time()-started:.1f}s", flush=True)
 
         except Exception as error:
 
