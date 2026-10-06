@@ -11,7 +11,7 @@ from flask import Flask, jsonify
 
 
 # ============================================================
-# V5.2 — PUMP HUNTER / FUTURES RADAR
+# V5.3.3 — PUMP HUNTER / FUTURES RADAR
 # ============================================================
 
 VERSION = "V5.3.2"
@@ -49,7 +49,7 @@ GAIN_TARGET = 3.0
 LOSS_TARGET = -5.0
 
 # Janela completa de avaliação
-LAB_WINDOW = 15 * 60
+LAB_WINDOW = 24 * 60 * 60
 
 # Históricos
 HISTORY_SECONDS = 70 * 60
@@ -100,7 +100,7 @@ db_lock = threading.Lock()
 # BANCO
 # ============================================================
 
-DB_PATH = os.getenv("ANALYTICS_DB", "pump_hunter_v532.db")
+DB_PATH = os.getenv("ANALYTICS_DB", "pump_hunter_v533.db")
 
 
 def db_connect():
@@ -124,7 +124,7 @@ def init_db():
 
             side TEXT DEFAULT 'LONG',
 
-            alert_sent INTEGER DEFAULT 1,
+            alert_sent INTEGER DEFAULT 0,
             alert_sent_at REAL,
 
             entry_price REAL,
@@ -203,8 +203,12 @@ def init_db():
             mae_elapsed REAL,
 
             outcome TEXT,
+
+            signal_number TEXT,
             outcome_at REAL,
             outcome_elapsed REAL,
+
+            signal_number TEXT,
 
             complete INTEGER DEFAULT 0,
             completed_at REAL
@@ -278,7 +282,9 @@ def init_db():
 
             "outcome": "TEXT",
             "outcome_at": "REAL",
-            "outcome_elapsed": "REAL"
+            "outcome_elapsed": "REAL",
+
+            "signal_number": "TEXT"
         }
 
         for name, definition in columns.items():
@@ -1628,8 +1634,8 @@ def register_signal(candidate, detected_at):
             symbol,
             candidate["side"],
 
-            1,
-            time.time(),
+            0,
+            None,
 
             candidate["entry"],
             candidate["stop"],
@@ -1689,6 +1695,13 @@ def register_signal(candidate, detected_at):
 
         signal_id = cur.lastrowid
 
+        signal_number = f"SINAL #{signal_id:06d}"
+
+        conn.execute(
+            "UPDATE signals SET signal_number=? WHERE id=?",
+            (signal_number, signal_id)
+        )
+
         conn.commit()
         conn.close()
 
@@ -1716,6 +1729,32 @@ def register_signal(candidate, detected_at):
     }
 
     return signal_id
+
+
+def mark_alert_sent(signal_id):
+
+    with db_lock:
+        conn = db_connect()
+        conn.execute(
+            "UPDATE signals SET alert_sent=1, alert_sent_at=? WHERE id=?",
+            (time.time(), signal_id)
+        )
+        conn.commit()
+        conn.close()
+
+
+def discard_signal(signal_id):
+
+    active_observations.pop(signal_id, None)
+
+    with db_lock:
+        conn = db_connect()
+        conn.execute(
+            "DELETE FROM signals WHERE id=?",
+            (signal_id,)
+        )
+        conn.commit()
+        conn.close()
 
 
 # ============================================================
@@ -1850,7 +1889,7 @@ def update_active_observations(tickers, now):
 
             if obs["outcome"] is None:
 
-                obs["outcome"] = "NEUTRAL"
+                obs["outcome"] = "EXPIRED"
 
                 obs["outcome_at"] = now
 
@@ -2074,7 +2113,7 @@ def completed_rows_after(
         AND outcome IN (
             'GAIN',
             'LOSS',
-            'NEUTRAL'
+            'EXPIRED'
         )
 
         ORDER BY id ASC
@@ -2112,7 +2151,7 @@ def completed_since(seconds):
         AND outcome IN (
             'GAIN',
             'LOSS',
-            'NEUTRAL'
+            'EXPIRED'
         )
 
         AND completed_at >= ?
@@ -2148,9 +2187,9 @@ def report_metrics(rows):
         if r["outcome"] == "LOSS"
     ]
 
-    neutral = [
+    expired = [
         r for r in rows
-        if r["outcome"] == "NEUTRAL"
+        if r["outcome"] == "EXPIRED"
     ]
 
     def average(
@@ -2183,8 +2222,8 @@ def report_metrics(rows):
         "loss":
             len(losses),
 
-        "neutral":
-            len(neutral),
+        "expired":
+            len(expired),
 
         "gain_pct":
             len(gains)
@@ -2196,8 +2235,8 @@ def report_metrics(rows):
             / total
             * 100,
 
-        "neutral_pct":
-            len(neutral)
+        "expired_pct":
+            len(expired)
             / total
             * 100,
 
@@ -2327,7 +2366,7 @@ def bucket_lines(rows):
             f"n={metrics['total']} | "
             f"G {metrics['gain_pct']:.0f}% | "
             f"L {metrics['loss_pct']:.0f}% | "
-            f"N {metrics['neutral_pct']:.0f}% | "
+            f"E {metrics['expired_pct']:.0f}% | "
             f"MFE {metrics['mfe']:.2f}%"
         )
 
@@ -2372,9 +2411,9 @@ def build_report(
         f"*{metrics['loss']} "
         f"({metrics['loss_pct']:.1f}%)*",
 
-        f"🟡 NEUTRAL: "
-        f"*{metrics['neutral']} "
-        f"({metrics['neutral_pct']:.1f}%)*",
+        f"⌛ EXPIRED: "
+        f"*{metrics['expired']} "
+        f"({metrics['expired_pct']:.1f}%)*",
 
         "",
 
@@ -2534,6 +2573,8 @@ def format_alert(candidate):
 
     message = [
 
+        f"🚨 *SINAL #{candidate.get('signal_id', 'PENDENTE'):06d}*" if isinstance(candidate.get('signal_id'), int) else "🚨 *SINAL PENDENTE*",
+        "",
         f"{icon} *{side} — "
         f"{candidate['symbol']}*",
 
@@ -2868,33 +2909,39 @@ def monitor_loop():
                 >= ALERT_INTERVAL
             ):
 
-                message = format_alert(
-                    best
+                signal_id = register_signal(
+                    best,
+                    time.time()
                 )
 
-                sent = send_telegram(
-                    message
-                )
+                if signal_id:
 
-                if sent:
+                    best["signal_id"] = signal_id
 
-                    signal_id = register_signal(
-                        best,
-                        time.time()
+                    message = format_alert(
+                        best
                     )
 
-                    if signal_id:
+                    sent = send_telegram(
+                        message
+                    )
 
-                        last_alert_global_local = (
-                            time.time()
-                        )
+                    if sent:
+
+                        mark_alert_sent(signal_id)
+
+                        last_alert_global_local = time.time()
 
                         print(
                             "[ALERT]",
+                            f"SINAL #{signal_id:06d}",
                             best["side"],
                             best["symbol"],
                             f"score={best['score']:.0f}"
                         )
+
+                    else:
+                        discard_signal(signal_id)
 
             # ------------------------------------------------
             # RELATÓRIOS
