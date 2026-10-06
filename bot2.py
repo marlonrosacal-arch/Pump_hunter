@@ -41,6 +41,10 @@ MIN_SCORE = 76
 # Score considerado excepcional
 STRONG_SCORE = 86
 
+# Auditoria detalhada do score
+SCORE_AUDIT_LOG = True
+SCORE_BUCKETS = (60, 65, 70, 75, 76)
+
 # RR mínimo
 MIN_RR = 1.50
 
@@ -1073,12 +1077,31 @@ def analyze(symbol, history, ticker, market):
         diagnostic_penalties = sp
         diagnostic_strategy = "SHORT_DIAGNOSTIC"
 
+    # Auditoria: devolvemos todos os componentes do melhor lado,
+    # mesmo quando o setup fica abaixo do MIN_SCORE.
+    is_long = diagnostic_side == "LONG"
+    base_score = (
+        structure_long + min(trend_long, 15) + volume_score +
+        momentum_long + oi_score + volatility_score + market_long + entry_long
+        if is_long else
+        structure_short + min(trend_short, 15) + volume_score +
+        momentum_short + oi_score + volatility_score + market_short + entry_short
+    )
     return {
         **common,
         "side": diagnostic_side,
         "score": diagnostic_score,
-        "raw_score": diagnostic_score,
-        "entry_score": entry_long if diagnostic_side == "LONG" else entry_short,
+        "raw_score": base_score,
+        "base_score": base_score,
+        "penalty_points": round(base_score - diagnostic_score, 1),
+        "structure_score": structure_long if is_long else structure_short,
+        "trend_score": min(trend_long,15) if is_long else min(trend_short,15),
+        "volume_score": volume_score,
+        "momentum_score": momentum_long if is_long else momentum_short,
+        "oi_score": oi_score,
+        "volatility_score": volatility_score,
+        "market_score": market_long if is_long else market_short,
+        "entry_score": entry_long if is_long else entry_short,
         "quality": "BELOW_THRESHOLD",
         "strategy": diagnostic_strategy,
         "reasons": [],
@@ -2206,7 +2229,7 @@ def monitor_loop():
             # LOG
             # ------------------------------------------------
 
-            if True:
+            if SCORE_AUDIT_LOG:
 
                 print(
                     f"[FILTER] analisados={rejection_counts['analisados']} | "
@@ -2227,29 +2250,62 @@ def monitor_loop():
                     f"regime={market['regime']}"
                 )
 
-                # Diagnóstico dos melhores quase-sinais. Não gera alerta.
                 top_diag = sorted(
                     diagnostic_candidates,
-                    key=lambda c: (c["score"], c.get("volume_ratio", 0), abs(c.get("r15", 0))),
+                    key=lambda c: (c.get('score', 0), c.get('volume_ratio', 0), abs(c.get('r15', 0))),
                     reverse=True
                 )[:3]
 
                 if top_diag:
                     for d in top_diag:
-                        penalties = ", ".join(d.get("penalties", [])[:3]) or "sem penalizações fortes"
+                        penalties = ", ".join(d.get("penalties", [])[:4]) or "nenhuma"
                         print(
                             f"[TOP] {d['symbol']} {d['side']} "
-                            f"score={d['score']:.0f} "
-                            f"RSI={d.get('rsi', 0):.1f} "
-                            f"r5={d.get('r5', 0):+.2f}% "
-                            f"r15={d.get('r15', 0):+.2f}% "
-                            f"VOL=x{d.get('volume_ratio', 0):.1f} "
-                            f"OI={d.get('oi_change', 0):+.2f}% "
-                            f"stage={d.get('movement_stage', '?')} "
-                            f"div={d.get('rsi_divergence', 'NONE')} "
-                            f"| {d.get('gate_reason', 'N/A')} "
-                            f"| {penalties}"
+                            f"TOTAL={d['score']:.0f} BASE={d.get('base_score', d.get('raw_score',0)):.0f} "
+                            f"PEN=-{d.get('penalty_points',0):.0f} | "
+                            f"EST={d.get('structure_score',0):.0f} "
+                            f"TREND={d.get('trend_score',0):.0f} "
+                            f"VOL={d.get('volume_score',0):.0f} "
+                            f"MOM={d.get('momentum_score',0):.0f} "
+                            f"OI={d.get('oi_score',0):.0f} "
+                            f"VOLT={d.get('volatility_score',0):.0f} "
+                            f"MKT={d.get('market_score',0):.0f} "
+                            f"ENTRY={d.get('entry_score',0):.0f} "
+                            f"| RSI={d.get('rsi',0):.1f} "
+                            f"r5={d.get('r5',0):+.2f}% r15={d.get('r15',0):+.2f}% "
+                            f"VOLx={d.get('volume_ratio',0):.1f} OI%={d.get('oi_change',0):+.2f} "
+                            f"stage={d.get('movement_stage','?')} div={d.get('rsi_divergence','NONE')} "
+                            f"| {d.get('gate_reason','N/A')} | {penalties}"
                         )
+
+                # Distribuição dos scores: mostra se estamos perto do limiar.
+                buckets = {
+                    "<60": 0, "60-64": 0, "65-69": 0, "70-74": 0, "75": 0, "76+": 0
+                }
+                for d in diagnostic_candidates:
+                    sc = float(d.get('score', 0) or 0)
+                    if sc < 60: buckets["<60"] += 1
+                    elif sc < 65: buckets["60-64"] += 1
+                    elif sc < 70: buckets["65-69"] += 1
+                    elif sc < 75: buckets["70-74"] += 1
+                    elif sc < 76: buckets["75"] += 1
+                    else: buckets["76+"] += 1
+                print(
+                    "[BUCKETS] "
+                    + " | ".join(f"{k}={v}" for k,v in buckets.items())
+                )
+
+                # Melhor componente por baixo do score: útil para descobrir o gargalo.
+                if top_diag:
+                    d = top_diag[0]
+                    comps = {
+                        "EST": d.get("structure_score",0), "TREND": d.get("trend_score",0),
+                        "VOL": d.get("volume_score",0), "MOM": d.get("momentum_score",0),
+                        "OI": d.get("oi_score",0), "VOLT": d.get("volatility_score",0),
+                        "MKT": d.get("market_score",0), "ENTRY": d.get("entry_score",0)
+                    }
+                    weakest = min(comps.items(), key=lambda x: x[1])
+                    print(f"[WEAK] {d['symbol']} {d['side']} | menor componente={weakest[0]}:{weakest[1]:.0f}")
 
             if diagnostic_candidates:
                 max_diag = max(diagnostic_candidates, key=lambda c: c.get("score", 0))
