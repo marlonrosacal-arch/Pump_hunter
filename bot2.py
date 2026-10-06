@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 # V5.3.3 — PUMP HUNTER / FUTURES RADAR
 # ============================================================
 
-VERSION = "V5.3.2"
+VERSION = "V5.3.3"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -207,8 +207,6 @@ def init_db():
             signal_number TEXT,
             outcome_at REAL,
             outcome_elapsed REAL,
-
-            signal_number TEXT,
 
             complete INTEGER DEFAULT 0,
             completed_at REAL
@@ -1778,7 +1776,7 @@ def side_return(side, entry, price):
 
 
 # ============================================================
-# LABORATÓRIO — ACOMPANHAMENTO
+# LABORATÓRIO — ACOMPANHAMENTO 24H
 # ============================================================
 
 def update_active_observations(tickers, now):
@@ -1882,7 +1880,7 @@ def update_active_observations(tickers, now):
             fields["ret_900"] = ret
 
         # ----------------------------------------------------
-        # FINAL DOS 15 MINUTOS
+        # FINAL DA JANELA DE 24 HORAS
         # ----------------------------------------------------
 
         if elapsed >= LAB_WINDOW:
