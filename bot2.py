@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 # V5.2 — PUMP HUNTER / FUTURES RADAR
 # ============================================================
 
-VERSION = "V5.3"
+VERSION = "V5.3-DIAGNOSTICO-AUDITADO"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -1025,7 +1025,7 @@ def analyze(symbol, history, ticker, market):
             if ema9>ema21: reasons.append("EMA9 > EMA21")
             if accel15>0.20: reasons.append("Aceleração")
             if btc15>=0: reasons.append("BTC alinhado")
-            candidates.append({**common,"side":"LONG","score":long_score,"raw_score":long_score,"structure_score":structure_long,"trend_score":trend_long,"volume_score":volume_score,"momentum_score":momentum_long,"oi_score":oi_score,"volatility_score":volatility_score,"market_score":market_long,"entry_score":entry_long,"entry":entry,"stop":stop,"tp1":entry+risk*1.8,"tp2":entry+risk*2.7,"rr1":1.8,"rr2":2.7,"quality":"STRONG" if long_score>=STRONG_SCORE else ("GOOD" if long_score>=82 else "OPPORTUNITY"),"strategy":strategy,"reasons":reasons,"penalties":lp})
+            candidates.append({**common,"side":"LONG","score":long_score,"raw_score":long_score,"structure_score":structure_long,"trend_score":trend_long,"volume_score":volume_score,"momentum_score":momentum_long,"oi_score":oi_score,"volatility_score":volatility_score,"market_score":market_long,"entry_score":entry_long,"entry":entry,"stop":stop,"tp1":entry+risk*1.8,"tp2":entry+risk*2.7,"rr1":1.8,"rr2":2.7,"quality":"STRONG" if long_score>=STRONG_SCORE else ("GOOD" if long_score>=82 else "OPPORTUNITY"),"strategy":strategy,"reasons":reasons,"penalties":lp,"eligible":True,"score_pass":True,"direction_gate":True,"gate_reason":"OK"})
     # SHORT
     short_score=structure_short+min(trend_short,15)+volume_score+momentum_short+oi_score+volatility_score+market_short+entry_short
     sp=[]; sr=[]
@@ -1053,7 +1053,7 @@ def analyze(symbol, history, ticker, market):
             if vol_ratio>=1.2: reasons.append(f"Volume x{vol_ratio:.1f}")
             if oi>0.2: reasons.append(f"OI +{oi:.2f}%")
             if ema9<ema21: reasons.append("EMA9 < EMA21")
-            candidates.append({**common,"side":"SHORT","score":short_score,"raw_score":short_score,"structure_score":structure_short,"trend_score":trend_short,"volume_score":volume_score,"momentum_score":momentum_short,"oi_score":oi_score,"volatility_score":volatility_score,"market_score":market_short,"entry_score":entry_short,"entry":entry,"stop":stop,"tp1":entry-risk*1.8,"tp2":entry-risk*2.7,"rr1":1.8,"rr2":2.7,"quality":"STRONG" if short_score>=STRONG_SCORE else ("GOOD" if short_score>=82 else "OPPORTUNITY"),"strategy":strategy,"reasons":reasons,"penalties":sp})
+            candidates.append({**common,"side":"SHORT","score":short_score,"raw_score":short_score,"structure_score":structure_short,"trend_score":trend_short,"volume_score":volume_score,"momentum_score":momentum_short,"oi_score":oi_score,"volatility_score":volatility_score,"market_score":market_short,"entry_score":entry_short,"entry":entry,"stop":stop,"tp1":entry-risk*1.8,"tp2":entry-risk*2.7,"rr1":1.8,"rr2":2.7,"quality":"STRONG" if short_score>=STRONG_SCORE else ("GOOD" if short_score>=82 else "OPPORTUNITY"),"strategy":strategy,"reasons":reasons,"penalties":sp,"eligible":True,"score_pass":True,"direction_gate":True,"gate_reason":"OK"})
     if candidates:
         best_candidate=max(candidates,key=lambda c:(c["score"],c["entry_score"],c["volume_ratio"],abs(c["r15"])))
         best_candidate["eligible"] = True
@@ -1084,7 +1084,42 @@ def analyze(symbol, history, ticker, market):
         "reasons": [],
         "penalties": diagnostic_penalties,
         "eligible": False,
+        "score_pass": bool(diagnostic_score >= MIN_SCORE),
+        "direction_gate": bool(
+            (diagnostic_side == "LONG" and r5 > 0 and r15 > 0 and rsi_current >= 50)
+            or
+            (diagnostic_side == "SHORT" and r5 < 0 and r15 < 0 and rsi_current <= 50)
+        ),
+        "gate_reason": "PENDENTE",
     }
+
+
+def diagnostic_gate_reason(candidate):
+    """Explica exatamente por que o melhor candidato nao virou alerta."""
+    score = float(candidate.get("score", 0) or 0)
+    side = candidate.get("side", "?")
+    r5 = float(candidate.get("r5", 0) or 0)
+    r15 = float(candidate.get("r15", 0) or 0)
+    rsi_v = float(candidate.get("rsi", 0) or 0)
+
+    if score < MIN_SCORE:
+        return f"SCORE<{MIN_SCORE}"
+
+    if side == "LONG":
+        failed = []
+        if r5 <= 0: failed.append("r5<=0")
+        if r15 <= 0: failed.append("r15<=0")
+        if rsi_v < 50: failed.append("RSI<50")
+        return "OK" if not failed else "GATE:" + ",".join(failed)
+
+    if side == "SHORT":
+        failed = []
+        if r5 >= 0: failed.append("r5>=0")
+        if r15 >= 0: failed.append("r15>=0")
+        if rsi_v > 50: failed.append("RSI>50")
+        return "OK" if not failed else "GATE:" + ",".join(failed)
+
+    return "SIDE_UNKNOWN"
 
 
 # ============================================================
@@ -1575,7 +1610,7 @@ def bucket_lines(rows):
             f"n={metrics['total']} | "
             f"G {metrics['gain_pct']:.0f}% | "
             f"L {metrics['loss_pct']:.0f}% | "
-            f"N {metrics['neutral_pct']:.0f}% | "
+            f"E {metrics['expired_pct']:.0f}% | "
             f"MFE {metrics['mfe']:.2f}%"
         )
 
@@ -2071,6 +2106,10 @@ def monitor_loop():
 
             candidates = []
             diagnostic_candidates = []
+            rejection_counts = {
+                "analisados": 0, "score_ok": 0, "score_baixo": 0,
+                "gate_falhou": 0, "elegiveis": 0, "long": 0, "short": 0
+            }
 
             # ------------------------------------------------
             # ANALISA MOEDAS
@@ -2104,9 +2143,23 @@ def monitor_loop():
 
                 if candidate:
                     diagnostic_candidates.append(candidate)
+                    rejection_counts["analisados"] += 1
+                    if candidate.get("side") == "LONG":
+                        rejection_counts["long"] += 1
+                    elif candidate.get("side") == "SHORT":
+                        rejection_counts["short"] += 1
+
+                    candidate["gate_reason"] = diagnostic_gate_reason(candidate)
+                    if candidate.get("score", 0) >= MIN_SCORE:
+                        rejection_counts["score_ok"] += 1
+                    else:
+                        rejection_counts["score_baixo"] += 1
 
                     if candidate.get("eligible", False):
+                        rejection_counts["elegiveis"] += 1
                         candidates.append(candidate)
+                    elif candidate.get("score", 0) >= MIN_SCORE:
+                        rejection_counts["gate_falhou"] += 1
 
             # ------------------------------------------------
             # MELHOR OPORTUNIDADE
@@ -2156,6 +2209,15 @@ def monitor_loop():
             if True:
 
                 print(
+                    f"[FILTER] analisados={rejection_counts['analisados']} | "
+                    f"score>={MIN_SCORE}={rejection_counts['score_ok']} | "
+                    f"score<{MIN_SCORE}={rejection_counts['score_baixo']} | "
+                    f"gate_falhou={rejection_counts['gate_falhou']} | "
+                    f"elegiveis={rejection_counts['elegiveis']} | "
+                    f"LONG={rejection_counts['long']} SHORT={rejection_counts['short']}"
+                )
+
+                print(
                     f"[SCAN] {scan_count} | "
                     f"Monitoradas: {len(selected)}/{MAX_CONTRACTS} | "
                     f"Candidatos: {len(candidates)} | "
@@ -2185,8 +2247,17 @@ def monitor_loop():
                             f"OI={d.get('oi_change', 0):+.2f}% "
                             f"stage={d.get('movement_stage', '?')} "
                             f"div={d.get('rsi_divergence', 'NONE')} "
+                            f"| {d.get('gate_reason', 'N/A')} "
                             f"| {penalties}"
                         )
+
+            if diagnostic_candidates:
+                max_diag = max(diagnostic_candidates, key=lambda c: c.get("score", 0))
+                print(
+                    f"[MAX] {max_diag['symbol']} {max_diag['side']} "
+                    f"score={max_diag['score']:.0f} | {diagnostic_gate_reason(max_diag)}",
+                    flush=True
+                )
 
             print(f"[LOOP] fim ciclo | scan={scan_count} | candidatos={len(candidates)} | demorou={time.time()-started:.1f}s", flush=True)
 
