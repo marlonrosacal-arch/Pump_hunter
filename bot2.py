@@ -11,10 +11,10 @@ from flask import Flask, jsonify
 
 
 # ============================================================
-# V5.3.3 — PUMP HUNTER / FUTURES RADAR
+# V5.4 — PUMP HUNTER / FUTURES RADAR
 # ============================================================
 
-VERSION = "V5.3.3"
+VERSION = "V5.4"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -95,6 +95,23 @@ active_observations = {}
 
 db_lock = threading.Lock()
 
+# ============================================================
+# V5.4 — CONTEXTO MULTI-TIMEFRAME OFICIAL
+# ============================================================
+
+HTF_REFRESH_SECONDS = 300
+HTF_SYMBOL_LIMIT = 30
+HTF_INTERVALS = ("Min5", "Min15", "Min60", "Hour4")
+
+htf_cache = {}
+htf_symbols = []
+htf_lock = threading.Lock()
+last_htf_refresh = 0
+
+# Evita inversões SHORT -> LONG -> SHORT por ruído curto.
+OPPOSITE_FLIP_MINUTES = 30
+OPPOSITE_FLIP_SCORE = 86
+
 
 # ============================================================
 # BANCO
@@ -172,6 +189,17 @@ def init_db():
             eth60 REAL,
 
             volume_ratio REAL,
+
+            htf_score REAL,
+            htf_bias TEXT,
+            tf5m_bias TEXT,
+            tf15m_bias TEXT,
+            tf1h_bias TEXT,
+            tf4h_bias TEXT,
+            htf_rsi15 REAL,
+            htf_rsi1h REAL,
+            htf_volume15 REAL,
+            htf_volume1h REAL,
 
             from_high30 REAL,
             from_high60 REAL,
@@ -251,11 +279,33 @@ def init_db():
             "market_score": "REAL",
             "entry_score": "REAL",
 
+            "htf_score": "REAL",
+            "htf_bias": "TEXT",
+            "tf5m_bias": "TEXT",
+            "tf15m_bias": "TEXT",
+            "tf1h_bias": "TEXT",
+            "tf4h_bias": "TEXT",
+            "htf_rsi15": "REAL",
+            "htf_rsi1h": "REAL",
+            "htf_volume15": "REAL",
+            "htf_volume1h": "REAL",
+
             "eth15": "REAL",
             "eth30": "REAL",
             "eth60": "REAL",
 
             "volume_ratio": "REAL",
+
+            "htf_score": "REAL",
+            "htf_bias": "TEXT",
+            "tf5m_bias": "TEXT",
+            "tf15m_bias": "TEXT",
+            "tf1h_bias": "TEXT",
+            "tf4h_bias": "TEXT",
+            "htf_rsi15": "REAL",
+            "htf_rsi1h": "REAL",
+            "htf_volume15": "REAL",
+            "htf_volume1h": "REAL",
 
             "breakout": "INTEGER DEFAULT 0",
             "false_breakout": "INTEGER DEFAULT 0",
@@ -504,6 +554,294 @@ def get_all_tickers():
             continue
 
     return result
+
+
+# ============================================================
+# MEXC KLINES — CONTEXTO REAL DE TIMEFRAME
+# ============================================================
+
+def _kline_series(data):
+
+    if not isinstance(data, dict):
+        return []
+
+    closes = data.get("close") or []
+    opens = data.get("open") or []
+    highs = data.get("high") or []
+    lows = data.get("low") or []
+    vols = data.get("vol") or []
+    times = data.get("time") or []
+
+    n = min(
+        len(closes),
+        len(times)
+    )
+
+    rows = []
+
+    for i in range(n):
+        try:
+            rows.append({
+                "time": float(times[i]),
+                "open": float(opens[i]) if i < len(opens) else float(closes[i]),
+                "high": float(highs[i]) if i < len(highs) else float(closes[i]),
+                "low": float(lows[i]) if i < len(lows) else float(closes[i]),
+                "close": float(closes[i]),
+                "vol": float(vols[i]) if i < len(vols) else 0.0
+            })
+        except Exception:
+            continue
+
+    return rows
+
+
+def fetch_kline(symbol, interval):
+
+    data = mexc_get(
+        f"/api/v1/contract/kline/{symbol}",
+        {
+            "interval": interval,
+            "limit": 100
+        }
+    )
+
+    if not data:
+        return []
+
+    return _kline_series(
+        data.get("data", {})
+    )
+
+
+def analyze_timeframe(rows):
+
+    if len(rows) < 25:
+        return None
+
+    closes = [x["close"] for x in rows]
+    vols = [x["vol"] for x in rows]
+
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+    e50 = ema(closes, 50) if len(closes) >= 50 else None
+    r = rsi(closes, 14)
+
+    if e9 is None or e21 is None or r is None:
+        return None
+
+    if e50 is not None:
+        bull = closes[-1] > e21 and e9 > e21 and e21 > e50
+        bear = closes[-1] < e21 and e9 < e21 and e21 < e50
+    else:
+        bull = closes[-1] > e21 and e9 > e21
+        bear = closes[-1] < e21 and e9 < e21
+
+    bias = "BULLISH" if bull else "BEARISH" if bear else "NEUTRAL"
+
+    # Inclinação da EMA21: compara com uma janela anterior.
+    ema21_prev = ema(closes[:-5], 21) if len(closes) >= 30 else e21
+    ema_slope = pct_change(ema21_prev, e21) if ema21_prev else 0.0
+
+    # Volume da última vela contra a média das 20 anteriores.
+    vol_base = vols[-21:-1]
+    avg_vol = sum(vol_base) / len(vol_base) if vol_base else 0.0
+    volume_ratio = (vols[-1] / avg_vol) if avg_vol > 0 else 1.0
+
+    # Retornos úteis para diferenciar tendência de ruído.
+    r3 = pct_change(closes[-4], closes[-1]) if len(closes) >= 4 else 0.0
+    r6 = pct_change(closes[-7], closes[-1]) if len(closes) >= 7 else 0.0
+
+    return {
+        "bias": bias,
+        "close": closes[-1],
+        "ema9": e9,
+        "ema21": e21,
+        "ema50": e50,
+        "rsi": r,
+        "ema_slope": ema_slope,
+        "volume_ratio": volume_ratio,
+        "r3": r3,
+        "r6": r6
+    }
+
+
+def fetch_symbol_htf(symbol):
+
+    result = {}
+
+    for interval, key in (
+        ("Min5", "5m"),
+        ("Min15", "15m"),
+        ("Min60", "1h"),
+        ("Hour4", "4h")
+    ):
+        rows = fetch_kline(symbol, interval)
+        result[key] = analyze_timeframe(rows)
+
+    if not any(result.values()):
+        return None
+
+    return result
+
+
+def refresh_htf_context(symbols):
+
+    global last_htf_refresh
+
+    refreshed = 0
+
+    for symbol in symbols[:HTF_SYMBOL_LIMIT]:
+        try:
+            context = fetch_symbol_htf(symbol)
+            if context:
+                with htf_lock:
+                    htf_cache[symbol] = {
+                        "updated_at": time.time(),
+                        "timeframes": context
+                    }
+                refreshed += 1
+        except Exception as error:
+            print(
+                "[HTF ERROR]",
+                symbol,
+                type(error).__name__,
+                error
+            )
+
+    last_htf_refresh = time.time()
+
+    if refreshed:
+        print(
+            f"[HTF] Atualizados {refreshed}/{min(len(symbols), HTF_SYMBOL_LIMIT)}"
+        )
+
+
+def get_htf_context(symbol):
+
+    with htf_lock:
+        item = htf_cache.get(symbol)
+
+    if not item:
+        return None
+
+    return item.get("timeframes")
+
+
+def htf_summary(context):
+
+    if not context:
+        return {
+            "score": 0,
+            "bias": "NEUTRAL",
+            "direction": None,
+            "reversal_confirmed": False
+        }
+
+    weights = {
+        "5m": 10,
+        "15m": 25,
+        "1h": 30,
+        "4h": 20
+    }
+
+    bullish = 0
+    bearish = 0
+
+    for key, weight in weights.items():
+        tf = context.get(key)
+        if not tf:
+            continue
+        if tf["bias"] == "BULLISH":
+            bullish += weight
+        elif tf["bias"] == "BEARISH":
+            bearish += weight
+
+    total = bullish + bearish
+
+    if bullish >= 55 and bullish > bearish + 15:
+        bias = "STRONG_LONG"
+        direction = "LONG"
+    elif bullish >= 40 and bullish > bearish + 10:
+        bias = "LONG"
+        direction = "LONG"
+    elif bearish >= 55 and bearish > bullish + 15:
+        bias = "STRONG_SHORT"
+        direction = "SHORT"
+    elif bearish >= 40 and bearish > bullish + 10:
+        bias = "SHORT"
+        direction = "SHORT"
+    else:
+        bias = "NEUTRAL"
+        direction = None
+
+    score = max(bullish, bearish)
+
+    # Reversão precisa de 15m + 1h concordando; 4h pode ainda estar atrasado.
+    tf15 = context.get("15m")
+    tf1h = context.get("1h")
+    reversal_confirmed = bool(
+        tf15 and tf1h and
+        tf15["bias"] == tf1h["bias"] and
+        tf15["rsi"] is not None and
+        tf1h["rsi"] is not None and
+        ((tf15["bias"] == "BULLISH" and tf15["rsi"] >= 52 and tf1h["rsi"] >= 50) or
+         (tf15["bias"] == "BEARISH" and tf15["rsi"] <= 48 and tf1h["rsi"] <= 50))
+    )
+
+    return {
+        "score": score,
+        "bias": bias,
+        "direction": direction,
+        "reversal_confirmed": reversal_confirmed
+    }
+
+
+def htf_market_context():
+
+    btc = get_htf_context("BTC_USDT")
+    eth = get_htf_context("ETH_USDT")
+
+    btc_sum = htf_summary(btc)
+    eth_sum = htf_summary(eth)
+
+    if btc_sum["direction"] == "LONG" and eth_sum["direction"] == "LONG":
+        regime = "BULLISH"
+    elif btc_sum["direction"] == "SHORT" and eth_sum["direction"] == "SHORT":
+        regime = "BEARISH"
+    elif btc_sum["direction"] or eth_sum["direction"]:
+        regime = "EXPANSION"
+    else:
+        regime = "SIDEWAYS"
+
+    return {
+        "btc": btc,
+        "eth": eth,
+        "btc_summary": btc_sum,
+        "eth_summary": eth_sum,
+        "regime": regime
+    }
+
+
+def htf_refresh_loop():
+
+    time.sleep(5)
+
+    while running:
+        try:
+            with htf_lock:
+                symbols = list(htf_symbols)
+
+            if symbols:
+                refresh_htf_context(symbols)
+
+        except Exception as error:
+            print(
+                "[HTF LOOP ERROR]",
+                type(error).__name__,
+                error
+            )
+
+        time.sleep(HTF_REFRESH_SECONDS)
 
 
 # ============================================================
@@ -947,9 +1285,7 @@ def analyze(symbol, history, ticker, market):
         return None
 
     prices = [x[1] for x in history]
-
     current = prices[-1]
-
     returns = get_returns(history)
 
     r5 = returns["r5"]
@@ -958,24 +1294,11 @@ def analyze(symbol, history, ticker, market):
     r30 = returns["r30"]
     r60 = returns["r60"]
 
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
     accel15 = r15 - (r30 / 2)
-
     accel5 = r5 - (r10 - r5)
 
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
     rsi_current = rsi(prices[-120:], 14)
-
-    rsi_previous = rsi(
-        prices[-132:-12],
-        14
-    )
+    rsi_previous = rsi(prices[-132:-12], 14)
 
     if rsi_current is None:
         return None
@@ -985,10 +1308,6 @@ def analyze(symbol, history, ticker, market):
 
     rsi_delta = rsi_current - rsi_previous
 
-    # --------------------------------------------------------
-    # EMA
-    # --------------------------------------------------------
-
     ema9 = ema(prices[-100:], 9)
     ema21 = ema(prices[-100:], 21)
     ema50 = ema(prices[-100:], 50)
@@ -996,87 +1315,91 @@ def analyze(symbol, history, ticker, market):
     if None in (ema9, ema21, ema50):
         return None
 
-    # --------------------------------------------------------
-    # ESTRUTURA
-    # --------------------------------------------------------
-
     structure = structure_analysis(history)
-
-    # --------------------------------------------------------
-    # VOLUME / OI
-    # --------------------------------------------------------
-
     oi = oi_change(history, 60)
-
     vol_ratio = volume_ratio(history, 60)
 
     # --------------------------------------------------------
-    # MERCADO
+    # CONTEXTO MULTI-TIMEFRAME REAL
     # --------------------------------------------------------
 
-    btc15 = market["btc15"]
-    btc30 = market["btc30"]
-    btc60 = market["btc60"]
+    htf = get_htf_context(symbol)
 
-    eth15 = market["eth15"]
-    eth30 = market["eth30"]
-    eth60 = market["eth60"]
-
-    # --------------------------------------------------------
-    # DIREÇÃO
-    # --------------------------------------------------------
-    # A direção é definida antes do score para que LONG e SHORT
-    # sejam avaliados de forma simétrica. A versão anterior
-    # pontuava estrutura/tendência principalmente como LONG e
-    # depois reutilizava o mesmo score para SHORT.
-
-    bullish = (
-        current > ema21
-        and r15 > 0
-        and r30 > 0
-    )
-
-    bearish = (
-        current < ema21
-        and r15 < 0
-        and r30 < 0
-    )
-
-    if not bullish and not bearish:
+    if not htf:
         return None
 
-    side = "LONG" if bullish else "SHORT"
+    hs = htf_summary(htf)
+    htf_direction = hs["direction"]
+
+    # Não permitimos que um gatilho de poucos segundos escolha
+    # sozinho a direção. Primeiro precisa existir um viés de 15m/1h/4h.
+    if htf_direction is None:
+        return None
 
     # --------------------------------------------------------
-    # TENDÊNCIA — 15
+    # GATILHO RÁPIDO — 20 PONTOS
     # --------------------------------------------------------
 
-    trend_score = 0
+    trigger_score = 0
 
-    if side == "LONG":
-        if current > ema9:
-            trend_score += 4
-        if ema9 > ema21:
-            trend_score += 5
-        if ema21 > ema50:
-            trend_score += 6
+    if htf_direction == "LONG":
+        if r5 > 0:
+            trigger_score += 4
+        if r15 > 0:
+            trigger_score += 4
+        if rsi_current >= 50:
+            trigger_score += 3
+        if rsi_delta > 0:
+            trigger_score += 2
+        if accel15 > 0:
+            trigger_score += 2
+        if structure["breakout"]:
+            trigger_score += 3
+        if current >= ema9:
+            trigger_score += 2
     else:
-        if current < ema9:
-            trend_score += 4
-        if ema9 < ema21:
-            trend_score += 5
-        if ema21 < ema50:
-            trend_score += 6
+        if r5 < 0:
+            trigger_score += 4
+        if r15 < 0:
+            trigger_score += 4
+        if rsi_current <= 50:
+            trigger_score += 3
+        if rsi_delta < 0:
+            trigger_score += 2
+        if accel15 < 0:
+            trigger_score += 2
+        if structure["breakout"]:
+            trigger_score += 3
+        if current <= ema9:
+            trigger_score += 2
+
+    trigger_score = min(trigger_score, 20)
 
     # --------------------------------------------------------
-    # ESTRUTURA — 20
+    # HTF — 30 PONTOS
+    # --------------------------------------------------------
+
+    htf_score = 0
+    tf5 = htf.get("5m")
+    tf15 = htf.get("15m")
+    tf1h = htf.get("1h")
+    tf4h = htf.get("4h")
+
+    tf_weights = {"5m": 3, "15m": 9, "1h": 11, "4h": 7}
+
+    for key, weight in tf_weights.items():
+        tf = htf.get(key)
+        if tf and ((htf_direction == "LONG" and tf["bias"] == "BULLISH") or
+                   (htf_direction == "SHORT" and tf["bias"] == "BEARISH")):
+            htf_score += weight
+
+    # --------------------------------------------------------
+    # ESTRUTURA — 15
     # --------------------------------------------------------
 
     structure_score = 0
 
-    if side == "LONG":
-        if structure["bull"]:
-            structure_score += 5
+    if htf_direction == "LONG":
         if current > ema21:
             structure_score += 4
         if current > ema50:
@@ -1085,11 +1408,9 @@ def analyze(symbol, history, ticker, market):
             structure_score += 3
         if r60 > 0:
             structure_score += 2
-        if structure["breakout"] and not structure.get("breakdown", False):
+        if structure["breakout"]:
             structure_score += 3
     else:
-        if structure["bear"]:
-            structure_score += 5
         if current < ema21:
             structure_score += 4
         if current < ema50:
@@ -1098,10 +1419,10 @@ def analyze(symbol, history, ticker, market):
             structure_score += 3
         if r60 < 0:
             structure_score += 2
-        if structure.get("breakdown", False):
+        if structure["breakout"]:
             structure_score += 3
 
-    structure_score = min(structure_score, 20)
+    structure_score = min(structure_score, 15)
 
     # --------------------------------------------------------
     # VOLUME — 15
@@ -1109,126 +1430,94 @@ def analyze(symbol, history, ticker, market):
 
     volume_score = 0
 
+    tf5_vol = tf5["volume_ratio"] if tf5 else 1.0
+    tf15_vol = tf15["volume_ratio"] if tf15 else 1.0
+    tf1h_vol = tf1h["volume_ratio"] if tf1h else 1.0
+
     if vol_ratio >= 1.20:
-        volume_score += 5
+        volume_score += 3
     if vol_ratio >= 1.50:
-        volume_score += 5
-    if vol_ratio >= 2.00:
-        volume_score += 5
+        volume_score += 2
+    if tf5_vol >= 1.20:
+        volume_score += 1
+    if tf15_vol >= 1.20:
+        volume_score += 2
+    if tf1h_vol >= 1.10:
+        volume_score += 2
 
-    volume_score = min(volume_score, 15)
+    volume_score = min(volume_score, 10)
 
     # --------------------------------------------------------
-    # MOMENTUM — 10
+    # RSI / MOMENTUM — 10
     # --------------------------------------------------------
-    # Ajustado para o horizonte real do scanner (5 s). Os limites
-    # anteriores de +0.30/+0.60 eram altos demais para movimentos
-    # iniciais; agora medimos intensidade na direção do sinal.
 
     momentum_score = 0
 
-    directional_r5 = r5 if side == "LONG" else -r5
-    directional_r15 = r15 if side == "LONG" else -r15
-    directional_r30 = r30 if side == "LONG" else -r30
-    directional_accel15 = accel15 if side == "LONG" else -accel15
-    directional_accel5 = accel5 if side == "LONG" else -accel5
-
-    if directional_r15 >= 0.05:
-        momentum_score += 3
-    if directional_r30 >= 0.10:
-        momentum_score += 2
-    if directional_accel15 >= 0.03:
-        momentum_score += 3
-    if directional_accel5 >= 0.02:
-        momentum_score += 2
+    if htf_direction == "LONG":
+        if rsi_current >= 50:
+            momentum_score += 2
+        if rsi_delta > 0:
+            momentum_score += 2
+        if tf15 and tf15["rsi"] >= 50:
+            momentum_score += 2
+        if tf1h and tf1h["rsi"] >= 50:
+            momentum_score += 2
+        if accel15 > 0:
+            momentum_score += 2
+    else:
+        if rsi_current <= 50:
+            momentum_score += 2
+        if rsi_delta < 0:
+            momentum_score += 2
+        if tf15 and tf15["rsi"] <= 50:
+            momentum_score += 2
+        if tf1h and tf1h["rsi"] <= 50:
+            momentum_score += 2
+        if accel15 < 0:
+            momentum_score += 2
 
     momentum_score = min(momentum_score, 10)
 
     # --------------------------------------------------------
-    # OI — 15
+    # OI — 5
     # --------------------------------------------------------
-    # OI positivo é tratado como participação crescente. Não
-    # damos pontos a OI negativo, pois ele pode representar
-    # fechamento/liquidação e não confirma a direção sozinho.
 
     oi_score = 0
-
-    if oi > 0.05:
-        oi_score += 4
-    if oi > 0.15:
-        oi_score += 5
-    if oi > 0.30:
-        oi_score += 6
-
-    oi_score = min(oi_score, 15)
-
-    # --------------------------------------------------------
-    # VOLATILIDADE — 10
-    # --------------------------------------------------------
-
-    volatility_score = 0
-
-    recent_returns = []
-
-    for i in range(max(1, len(prices) - 60), len(prices)):
-        if prices[i - 1] != 0:
-            recent_returns.append(
-                pct_change(prices[i - 1], prices[i])
-            )
-
-    vol = rolling_std(recent_returns)
-
-    if vol > 0.03:
-        volatility_score += 3
-    if vol > 0.06:
-        volatility_score += 3
-
-    # Movimento de pelo menos 0.01% em 15 s recebe contexto
-    # de volatilidade; movimentos extremos não ganham pontos
-    # extras indefinidamente.
-    if 0.01 < abs(r15) < 2.5:
-        volatility_score += 4
-
-    volatility_score = min(volatility_score, 10)
+    if htf_direction == "LONG":
+        if oi > 0.05:
+            oi_score += 2
+        if oi > 0.20:
+            oi_score += 3
+    else:
+        if oi < -0.05:
+            oi_score += 2
+        if oi < -0.20:
+            oi_score += 3
+    oi_score = min(oi_score, 5)
 
     # --------------------------------------------------------
-    # MERCADO — 10
+    # MERCADO — 5
     # --------------------------------------------------------
-    # BTC/ETH agora são avaliados na mesma direção do sinal.
-    # Em SIDEWAYS, o mercado deixa de retirar pontos de uma boa
-    # oportunidade de altcoin; ele simplesmente não exige
-    # confirmação forte.
 
     market_score = 0
+    market_dir = market["regime"]
 
-    if side == "LONG":
-        if btc15 >= -0.10:
-            market_score += 2
-        if btc60 >= -0.25:
-            market_score += 2
-        if eth15 >= -0.10:
-            market_score += 2
-        if eth60 >= -0.25:
-            market_score += 2
-        if market["regime"] in ("BULLISH", "EXPANSION"):
-            market_score += 2
-        elif market["regime"] == "SIDEWAYS":
+    if htf_direction == "LONG":
+        if market_dir in ("BULLISH", "EXPANSION"):
+            market_score += 3
+        if market.get("btc_summary", {}).get("direction") == "LONG":
+            market_score += 1
+        if market.get("eth_summary", {}).get("direction") == "LONG":
             market_score += 1
     else:
-        if btc15 <= 0.10:
-            market_score += 2
-        if btc60 <= 0.25:
-            market_score += 2
-        if eth15 <= 0.10:
-            market_score += 2
-        if eth60 <= 0.25:
-            market_score += 2
-        if market["regime"] in ("BEARISH", "EXPANSION"):
-            market_score += 2
-        elif market["regime"] == "SIDEWAYS":
+        if market_dir in ("BEARISH", "EXPANSION"):
+            market_score += 3
+        if market.get("btc_summary", {}).get("direction") == "SHORT":
+            market_score += 1
+        if market.get("eth_summary", {}).get("direction") == "SHORT":
             market_score += 1
 
-    market_score = min(market_score, 10)
+    market_score = min(market_score, 5)
 
     # --------------------------------------------------------
     # ENTRADA — 5
@@ -1236,170 +1525,105 @@ def analyze(symbol, history, ticker, market):
 
     entry_score = 0
 
-    if side == "LONG":
-        if structure["breakout"] and not structure.get("breakdown", False):
-            entry_score += 3
-        if abs(structure["distance_resistance"]) < 0.8:
-            entry_score += 2
-    else:
-        if structure.get("breakdown", False):
-            entry_score += 3
-        if abs(structure["distance_support"]) < 0.8:
-            entry_score += 2
+    if structure["breakout"]:
+        entry_score += 3
+
+    if htf_direction == "LONG" and current >= ema9:
+        entry_score += 2
+    elif htf_direction == "SHORT" and current <= ema9:
+        entry_score += 2
 
     entry_score = min(entry_score, 5)
 
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
     raw_score = (
-        structure_score
-        + min(trend_score, 15)
+        htf_score
+        + trigger_score
+        + structure_score
         + volume_score
         + momentum_score
-        + min(oi_score, 15)
-        + volatility_score
+        + oi_score
         + market_score
         + entry_score
     )
 
     score = raw_score
-
     penalties = []
 
     # --------------------------------------------------------
-    # PENALIDADES DIRECIONAIS
+    # PULLBACK VS REVERSÃO
     # --------------------------------------------------------
 
-    if side == "LONG":
-        if btc15 < -0.60:
-            score -= 8
-            penalties.append("BTC contra")
-        if btc60 < -1.50:
-            score -= 7
-            penalties.append("BTC forte queda")
-        if eth15 < -0.60:
-            score -= 4
-            penalties.append("ETH contra")
-        if rsi_current > 78:
-            score -= 10
-            penalties.append("RSI esticado")
-        if oi < -0.50:
-            score -= 6
-            penalties.append("OI negativo")
-        if current < ema21:
-            score -= 8
-            penalties.append("abaixo EMA21")
-        if ema21 < ema50:
-            score -= 6
-            penalties.append("EMA21 < EMA50")
-        if structure.get("false_breakout", False) and not structure.get("false_breakdown", False):
-            score -= 15
-            penalties.append("falso rompimento")
-        if r30 > 2.50:
-            score -= 8
-            penalties.append("entrada esticada")
-    else:
-        if btc15 > 0.60:
-            score -= 8
-            penalties.append("BTC contra SHORT")
-        if btc60 > 1.50:
-            score -= 7
-            penalties.append("BTC forte alta")
-        if eth15 > 0.60:
-            score -= 4
-            penalties.append("ETH contra SHORT")
-        if rsi_current < 22:
-            score -= 8
-            penalties.append("RSI muito sobrevendido")
-        if oi < -0.50:
-            score -= 6
-            penalties.append("OI negativo")
-        if current > ema21:
-            score -= 8
-            penalties.append("acima EMA21")
-        if ema21 > ema50:
-            score -= 6
-            penalties.append("EMA21 > EMA50")
-        if structure.get("false_breakdown", False):
-            score -= 15
-            penalties.append("falso breakdown")
-        if r30 < -2.50:
-            score -= 8
-            penalties.append("entrada esticada")
+    short_term_against = (
+        htf_direction == "LONG" and r5 < 0 and r15 < 0
+    ) or (
+        htf_direction == "SHORT" and r5 > 0 and r15 > 0
+    )
+
+    if short_term_against:
+        score -= 12
+        penalties.append("pullback contra o gatilho")
+
+    if structure["false_breakout"]:
+        score -= 10
+        penalties.append("falso rompimento")
+
+    if htf_direction == "LONG" and r30 < -0.8:
+        score -= 8
+        penalties.append("30m contra LONG")
+
+    if htf_direction == "SHORT" and r30 > 0.8:
+        score -= 8
+        penalties.append("30m contra SHORT")
+
+    if htf_direction == "LONG" and rsi_current > 78:
+        score -= 8
+        penalties.append("RSI esticado LONG")
+
+    if htf_direction == "SHORT" and rsi_current < 22:
+        score -= 8
+        penalties.append("RSI esticado SHORT")
+
+    # Reversão contra o último sinal só é aceita com confirmação real.
+    if htf_direction == "LONG" and hs["reversal_confirmed"]:
+        pass
+    elif htf_direction == "SHORT" and hs["reversal_confirmed"]:
+        pass
 
     score = max(0, min(100, score))
-
-    # --------------------------------------------------------
-    # VALIDAÇÃO DO SETUP
-    # --------------------------------------------------------
 
     if score < MIN_SCORE:
         return None
 
-    if side == "LONG":
+    # Trigger precisa estar minimamente alinhado; o HTF não deve gerar
+    # alerta apenas porque as médias longas estão alinhadas.
+    if trigger_score < 8:
+        return None
 
-        if r5 <= 0:
-            return None
+    side = htf_direction
 
-        if r15 <= 0:
-            return None
-
-        if rsi_current < 50:
-            return None
-
-    else:
-
-        if r5 >= 0:
-            return None
-
-        if r15 >= 0:
-            return None
-
-        if rsi_current > 50:
-            return None
-
-    # --------------------------------------------------------
-    # ENTRADA / STOP / TP
-    # --------------------------------------------------------
+    # Não perseguir preço já esticado no micro movimento.
+    if side == "LONG" and r5 > 1.2:
+        return None
+    if side == "SHORT" and r5 < -1.2:
+        return None
 
     resistance = structure["resistance"]
     support = structure["support"]
 
     if side == "LONG":
-
         entry = current
-
-        structural_stop = (
-            support * 0.998
-            if support
-            else current * 0.985
-        )
-
+        structural_stop = support * 0.998 if support else current * 0.985
         risk = entry - structural_stop
-
         if risk <= 0:
             return None
-
         tp1 = entry + risk * 1.8
         tp2 = entry + risk * 2.7
-
     else:
-
         entry = current
-
-        structural_stop = (
-            resistance * 1.002
-            if resistance
-            else current * 1.015
-        )
-
+        structural_stop = resistance * 1.002 if resistance else current * 1.015
         risk = structural_stop - entry
-
         if risk <= 0:
             return None
-
         tp1 = entry - risk * 1.8
         tp2 = entry - risk * 2.7
 
@@ -1409,115 +1633,94 @@ def analyze(symbol, history, ticker, market):
     if rr1 < MIN_RR:
         return None
 
-    # --------------------------------------------------------
-    # QUALIDADE
-    # --------------------------------------------------------
-
     if score >= STRONG_SCORE:
         quality = "STRONG"
-
     elif score >= 82:
         quality = "GOOD"
-
     else:
         quality = "OPPORTUNITY"
 
-    # --------------------------------------------------------
-    # MOTIVOS
-    # --------------------------------------------------------
-
     reasons = []
 
+    if hs["bias"]:
+        reasons.append(f"HTF {hs['bias']}")
+    if tf15:
+        reasons.append(f"15m {tf15['bias']}")
+    if tf1h:
+        reasons.append(f"1h {tf1h['bias']}")
+    if tf4h:
+        reasons.append(f"4h {tf4h['bias']}")
+    if tf15 and tf15["rsi"] is not None:
+        reasons.append(f"RSI15 {tf15['rsi']:.0f}")
+    if tf15_vol >= 1.2:
+        reasons.append(f"Vol15 x{tf15_vol:.1f}")
+    if vol_ratio >= 1.2:
+        reasons.append(f"Trigger vol x{vol_ratio:.1f}")
     if structure["breakout"]:
         reasons.append("Rompimento")
-
-    if vol_ratio >= 1.20:
-        reasons.append(
-            f"Volume x{vol_ratio:.1f}"
-        )
-
-    if oi > 0.20:
-        reasons.append(
-            f"OI +{oi:.2f}%"
-        )
-
-    if ema9 > ema21:
-        reasons.append("EMA9 > EMA21")
-
-    if ema21 > ema50:
-        reasons.append("EMA21 > EMA50")
-
-    if accel15 > 0.20:
-        reasons.append("Aceleração")
-
-    if btc15 >= 0:
-        reasons.append("BTC alinhado")
-
-    if eth15 >= 0:
-        reasons.append("ETH alinhado")
+    if rsi_delta > 0 and side == "LONG":
+        reasons.append("RSI subindo")
+    if rsi_delta < 0 and side == "SHORT":
+        reasons.append("RSI caindo")
 
     return {
         "symbol": symbol,
         "side": side,
-
         "score": round(score, 1),
         "raw_score": round(raw_score, 1),
-
         "structure_score": structure_score,
-        "trend_score": min(trend_score, 15),
+        "trend_score": htf_score,
         "volume_score": volume_score,
         "momentum_score": momentum_score,
-        "oi_score": min(oi_score, 15),
-        "volatility_score": volatility_score,
+        "oi_score": oi_score,
+        "volatility_score": trigger_score,
         "market_score": market_score,
         "entry_score": entry_score,
-
+        "htf_score": htf_score,
+        "htf_bias": hs["bias"],
+        "tf5m_bias": tf5["bias"] if tf5 else "NEUTRAL",
+        "tf15m_bias": tf15["bias"] if tf15 else "NEUTRAL",
+        "tf1h_bias": tf1h["bias"] if tf1h else "NEUTRAL",
+        "tf4h_bias": tf4h["bias"] if tf4h else "NEUTRAL",
+        "htf_rsi15": tf15["rsi"] if tf15 else 0.0,
+        "htf_rsi1h": tf1h["rsi"] if tf1h else 0.0,
+        "htf_volume15": tf15_vol,
+        "htf_volume1h": tf1h_vol,
         "entry": entry,
         "stop": structural_stop,
         "tp1": tp1,
         "tp2": tp2,
-
         "rr1": rr1,
         "rr2": rr2,
-
         "quality": quality,
-
         "r5": r5,
         "r10": r10,
         "r15": r15,
         "r30": r30,
         "r60": r60,
-
         "accel15": accel15,
         "accel5": accel5,
-
         "rsi": rsi_current,
         "rsi_delta": rsi_delta,
-
         "ema9": ema9,
         "ema21": ema21,
         "ema50": ema50,
-
         "oi_change": oi,
-
-        "btc15": btc15,
-        "btc30": btc30,
-        "btc60": btc60,
-
-        "eth15": eth15,
-        "eth30": eth30,
-        "eth60": eth60,
-
+        "btc15": market.get("btc_summary", {}).get("score", 0),
+        "btc30": 0.0,
+        "btc60": market.get("btc_summary", {}).get("score", 0),
+        "eth15": market.get("eth_summary", {}).get("score", 0),
+        "eth30": 0.0,
+        "eth60": market.get("eth_summary", {}).get("score", 0),
         "volume_ratio": vol_ratio,
-
         "breakout": structure["breakout"],
         "false_breakout": structure["false_breakout"],
-
         "regime": market["regime"],
-
         "reasons": reasons,
-        "penalties": penalties
+        "penalties": penalties,
+        "reversal_confirmed": hs["reversal_confirmed"]
     }
+
 
 
 # ============================================================
@@ -1572,6 +1775,17 @@ def register_signal(candidate, detected_at):
             market_score,
             entry_score,
 
+            htf_score,
+            htf_bias,
+            tf5m_bias,
+            tf15m_bias,
+            tf1h_bias,
+            tf4h_bias,
+            htf_rsi15,
+            htf_rsi1h,
+            htf_volume15,
+            htf_volume1h,
+
             r5,
             r10,
             r15,
@@ -1611,6 +1825,7 @@ def register_signal(candidate, detected_at):
             ?,?,?,?,
             ?,?,
             ?,?,?,?,?,?,?,?,
+            ?,?,?,?,?,?,?,?,?,?,
             ?,?,?,?,?,
             ?,?,
             ?,?,
@@ -1652,6 +1867,17 @@ def register_signal(candidate, detected_at):
             candidate["market_score"],
             candidate["entry_score"],
 
+            candidate["htf_score"],
+            candidate["htf_bias"],
+            candidate["tf5m_bias"],
+            candidate["tf15m_bias"],
+            candidate["tf1h_bias"],
+            candidate["tf4h_bias"],
+            candidate["htf_rsi15"],
+            candidate["htf_rsi1h"],
+            candidate["htf_volume15"],
+            candidate["htf_volume1h"],
+
             candidate["r5"],
             candidate["r10"],
             candidate["r15"],
@@ -1687,7 +1913,13 @@ def register_signal(candidate, detected_at):
 
             json.dumps({
                 "reasons": candidate["reasons"],
-                "penalties": candidate["penalties"]
+                "penalties": candidate["penalties"],
+                "htf_bias": candidate.get("htf_bias"),
+                "tf5m_bias": candidate.get("tf5m_bias"),
+                "tf15m_bias": candidate.get("tf15m_bias"),
+                "tf1h_bias": candidate.get("tf1h_bias"),
+                "tf4h_bias": candidate.get("tf4h_bias"),
+                "htf_score": candidate.get("htf_score")
             }, ensure_ascii=False)
         ))
 
@@ -2339,6 +2571,21 @@ def bucket_lines(rows):
             lambda r:
                 (r["volume_ratio"] or 0)
                 >= 1.5
+        ),
+
+        (
+            "HTF alinhado",
+            lambda r:
+                (r["htf_score"] or 0)
+                >= 24
+        ),
+
+        (
+            "15m + 1h alinhados",
+            lambda r:
+                r["tf15m_bias"] is not None
+                and r["tf15m_bias"] != "NEUTRAL"
+                and r["tf15m_bias"] == r["tf1h_bias"]
         )
     ]
 
@@ -2490,7 +2737,7 @@ def maybe_send_reports():
         ]
 
         title = (
-            "V5.2 — BLOCO "
+            "V5.4 — BLOCO "
             f"{block[0]['id']}-"
             f"{block[-1]['id']}"
         )
@@ -2529,7 +2776,7 @@ def maybe_send_reports():
 
         if send_telegram(
             build_report(
-                "V5.2 — RELATÓRIO SEMANAL",
+                "V5.4 — RELATÓRIO SEMANAL",
                 weekly_rows
             )
         ):
@@ -2609,6 +2856,18 @@ def format_alert(candidate):
         f"*Regime:* "
         f"{candidate['regime']}",
 
+        f"*HTF:* "
+        f"{candidate.get('htf_bias', 'NEUTRAL')} | "
+        f"5m {candidate.get('tf5m_bias', 'NEUTRAL')} | "
+        f"15m {candidate.get('tf15m_bias', 'NEUTRAL')} | "
+        f"1h {candidate.get('tf1h_bias', 'NEUTRAL')} | "
+        f"4h {candidate.get('tf4h_bias', 'NEUTRAL')}",
+
+        f"*RSI:* "
+        f"rápido {candidate.get('rsi', 0):.0f} | "
+        f"15m {candidate.get('htf_rsi15', 0):.0f} | "
+        f"1h {candidate.get('htf_rsi1h', 0):.0f}",
+
         "",
 
         "*Motivos:*",
@@ -2638,45 +2897,72 @@ def format_alert(candidate):
 # ESCOLHA DO MELHOR SINAL
 # ============================================================
 
-def choose_best(
-    candidates,
-    now
-):
+def opposite_recent_signal(symbol, side):
 
-    available = [
+    cutoff = time.time() - (OPPOSITE_FLIP_MINUTES * 60)
 
-        candidate
+    with db_lock:
+        conn = db_connect()
+        row = conn.execute("""
+        SELECT side, detected_at
+        FROM signals
+        WHERE symbol=?
+          AND alert_sent=1
+          AND detected_at>=?
+        ORDER BY id DESC
+        LIMIT 1
+        """, (symbol, cutoff)).fetchone()
+        conn.close()
 
-        for candidate
-        in candidates
+    if not row:
+        return False, None
 
-        if not symbol_recently_alerted(
-            candidate["symbol"]
+    return row["side"] != side, row["side"]
+
+
+def choose_best(candidates, now):
+
+    available = []
+
+    for candidate in candidates:
+        symbol = candidate["symbol"]
+
+        if symbol_recently_alerted(symbol):
+            continue
+
+        opposite, previous_side = opposite_recent_signal(
+            symbol,
+            candidate["side"]
         )
-    ]
+
+        if opposite:
+            # Flip só passa com confirmação dos timeframes maiores e score forte.
+            if not candidate.get("reversal_confirmed"):
+                continue
+            if candidate.get("score", 0) < OPPOSITE_FLIP_SCORE:
+                continue
+            if candidate.get("htf_score", 0) < 24:
+                continue
+
+        available.append(candidate)
 
     if not available:
         return None
 
     available.sort(
         key=lambda candidate: (
-
             candidate["score"],
-
-            candidate["quality"]
-            == "STRONG",
-
+            candidate.get("htf_score", 0),
+            candidate["quality"] == "STRONG",
+            candidate.get("htf_volume15", 0),
             candidate["volume_ratio"],
-
-            abs(
-                candidate["r15"]
-            )
+            abs(candidate["r15"])
         ),
-
         reverse=True
     )
 
     return available[0]
+
 
 
 # ============================================================
@@ -2844,7 +3130,22 @@ def monitor_loop():
             # CONTEXTO
             # ------------------------------------------------
 
-            market = market_context()
+            # Atualiza a lista usada pelo thread de contexto HTF.
+            global htf_symbols
+            with htf_lock:
+                htf_symbols = [
+                    t["symbol"]
+                    for t in selected[:HTF_SYMBOL_LIMIT]
+                ]
+
+            market = htf_market_context()
+
+            # Sem BTC/ETH HTF ainda, não liberamos sinais novos.
+            if market["btc"] is None and market["eth"] is None:
+                market = {
+                    **market,
+                    "regime": "SIDEWAYS"
+                }
 
             candidates = []
 
@@ -3049,6 +3350,9 @@ def home():
                 active_observations
             ),
 
+        "htf_cached_symbols": len(htf_cache),
+        "htf_last_refresh": last_htf_refresh,
+
         "contracts":
             len(contracts)
     })
@@ -3082,6 +3386,9 @@ def status():
                 active_observations
             ),
 
+        "htf_cached_symbols": len(htf_cache),
+        "htf_last_refresh": last_htf_refresh,
+
         "contracts":
             len(contracts),
 
@@ -3109,6 +3416,12 @@ def start():
 
     # Recupera sinais ainda em avaliação
     load_pending_observations()
+
+    # Contexto multi-timeframe oficial MEXC
+    threading.Thread(
+        target=htf_refresh_loop,
+        daemon=True
+    ).start()
 
     # Monitor
     threading.Thread(
