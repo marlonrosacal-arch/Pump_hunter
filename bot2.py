@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 # V5.4 — PUMP HUNTER / FUTURES RADAR
 # ============================================================
 
-VERSION = "V5.4"
+VERSION = "V5.4.1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -28,6 +28,14 @@ MEXC_BASE = "https://contract.mexc.com"
 SCAN_INTERVAL = 5
 
 MAX_CONTRACTS = 50
+
+# Radar ampliado: o universo é muito maior que as moedas mais líquidas.
+# Primeiro fazemos descoberta ampla; só depois usamos a análise profunda.
+RADAR_UNIVERSE = 250
+RADAR_LIQUIDITY_POOL = 100
+RADAR_MOVER_POOL = 100
+RADAR_LOWCAP_POOL = 100
+RADAR_MIN_AMOUNT24 = 1000.0
 
 ALERT_INTERVAL = 60
 
@@ -2704,6 +2712,63 @@ def build_report(
     return "\n".join(text)
 
 
+def sent_rows_after(cursor_id, limit=100):
+    with db_lock:
+        conn = db_connect()
+        rows = conn.execute("""
+        SELECT * FROM signals
+        WHERE id > ?
+        AND alert_sent = 1
+        ORDER BY id ASC
+        LIMIT ?
+        """, (cursor_id, limit)).fetchall()
+        conn.close()
+    return rows
+
+
+def sent_status_counts():
+    with db_lock:
+        conn = db_connect()
+        row = conn.execute("""
+        SELECT
+            COUNT(*) AS sent,
+            SUM(CASE WHEN complete=1 THEN 1 ELSE 0 END) AS completed,
+            SUM(CASE WHEN complete=0 THEN 1 ELSE 0 END) AS active,
+            SUM(CASE WHEN outcome='GAIN' THEN 1 ELSE 0 END) AS gains,
+            SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END) AS losses,
+            SUM(CASE WHEN outcome='EXPIRED' THEN 1 ELSE 0 END) AS expired
+        FROM signals
+        WHERE alert_sent=1
+        """).fetchone()
+        conn.close()
+    return dict(row) if row else {
+        "sent": 0, "completed": 0, "active": 0,
+        "gains": 0, "losses": 0, "expired": 0
+    }
+
+
+def build_sent_block_report(title, block):
+    counts = sent_status_counts()
+    completed = [r for r in block if r["complete"] == 1]
+    gains = sum(1 for r in completed if r["outcome"] == "GAIN")
+    losses = sum(1 for r in completed if r["outcome"] == "LOSS")
+    expired = sum(1 for r in completed if r["outcome"] == "EXPIRED")
+
+    return "\n".join([
+        f"*{title}*",
+        "",
+        f"🚨 Alertas enviados neste bloco: *{len(block)}*",
+        f"📊 Concluídos até agora: *{counts['completed']}*",
+        f"⏳ Ainda em avaliação: *{counts['active']}*",
+        "",
+        f"🟢 GAIN concluídos no bloco: *{gains}*",
+        f"🔴 LOSS concluídos no bloco: *{losses}*",
+        f"🟡 EXPIRED concluídos no bloco: *{expired}*",
+        "",
+        "ℹ️ Este é o relatório de envio. O laboratório de performance continua separado e só considera sinais concluídos.",
+    ])
+
+
 # ============================================================
 # RELATÓRIOS AUTOMÁTICOS
 # ============================================================
@@ -2713,78 +2778,93 @@ def maybe_send_reports():
     now = time.time()
 
     # --------------------------------------------------------
-    # BLOCO DE 100
+    # BLOCO DE 100 ALERTAS ENVIADOS
     # --------------------------------------------------------
+    sent_cursor_raw = get_meta("last_sent_block_cursor_id", None)
 
-    cursor = int(
-        float(
-            get_meta(
-                "last_block_cursor_id",
-                0
-            ) or 0
-        )
-    )
+    if sent_cursor_raw is None:
+        with db_lock:
+            conn = db_connect()
+            row = conn.execute(
+                "SELECT MAX(id) AS max_id FROM signals WHERE alert_sent=1"
+            ).fetchone()
+            conn.close()
+        set_meta("last_sent_block_cursor_id", row["max_id"] or 0)
+        sent_cursor = int(row["max_id"] or 0)
+    else:
+        sent_cursor = int(float(sent_cursor_raw or 0))
 
-    rows = completed_rows_after(
-        cursor,
+    sent_rows = sent_rows_after(
+        sent_cursor,
         REPORT_BLOCK_SIZE
     )
 
-    if len(rows) >= REPORT_BLOCK_SIZE:
-
-        block = rows[
-            :REPORT_BLOCK_SIZE
-        ]
-
-        title = (
-            "V5.4 — BLOCO "
-            f"{block[0]['id']}-"
-            f"{block[-1]['id']}"
+    counts = sent_status_counts()
+    if now % 300 < SCAN_INTERVAL:
+        print(
+            f"[REPORT] enviados={counts['sent']} | "
+            f"concluídos={counts['completed']} | "
+            f"ativos={counts['active']} | "
+            f"próximo_bloco={REPORT_BLOCK_SIZE}"
         )
 
-        if send_telegram(
-            build_report(
-                title,
-                block
-            )
-        ):
-
-            set_meta(
-                "last_block_cursor_id",
-                block[-1]["id"]
+    if len(sent_rows) >= REPORT_BLOCK_SIZE:
+        block = sent_rows[:REPORT_BLOCK_SIZE]
+        title = (
+            "V5.4.1 — ALERTAS "
+            f"{block[0]['id']}-{block[-1]['id']}"
+        )
+        if send_telegram(build_sent_block_report(title, block)):
+            set_meta("last_sent_block_cursor_id", block[-1]["id"])
+            print(
+                f"[REPORT] bloco enviado | "
+                f"ids={block[0]['id']}-{block[-1]['id']}"
             )
 
     # --------------------------------------------------------
-    # SEMANAL
+    # LABORATÓRIO — BLOCO DE 100 CONCLUÍDOS
     # --------------------------------------------------------
-
-    last_weekly = float(
-        get_meta(
-            "last_weekly_report_at",
-            0
-        ) or 0
+    lab_cursor = int(
+        float(get_meta("last_lab_cursor_id", 0) or 0)
+    )
+    lab_rows = completed_rows_after(
+        lab_cursor,
+        REPORT_BLOCK_SIZE
     )
 
-    if (
-        now - last_weekly
-        >= WEEKLY_SECONDS
-    ):
-
-        weekly_rows = completed_since(
-            WEEKLY_SECONDS
+    if len(lab_rows) >= REPORT_BLOCK_SIZE:
+        block = lab_rows[:REPORT_BLOCK_SIZE]
+        title = (
+            "V5.4.1 — LAB "
+            f"{block[0]['id']}-{block[-1]['id']}"
         )
-
-        if send_telegram(
-            build_report(
-                "V5.4 — RELATÓRIO SEMANAL",
-                weekly_rows
+        if send_telegram(build_report(title, block)):
+            set_meta("last_lab_cursor_id", block[-1]["id"])
+            print(
+                f"[REPORT] lab enviado | "
+                f"ids={block[0]['id']}-{block[-1]['id']}"
             )
-        ):
 
-            set_meta(
-                "last_weekly_report_at",
-                now
-            )
+    # --------------------------------------------------------
+    # SEMANAL — só consome a janela quando existe dado
+    # --------------------------------------------------------
+    last_weekly = float(
+        get_meta("last_weekly_report_at", 0) or 0
+    )
+
+    if now - last_weekly >= WEEKLY_SECONDS:
+        weekly_rows = completed_since(WEEKLY_SECONDS)
+        if weekly_rows:
+            if send_telegram(
+                build_report(
+                    "V5.4.1 — RELATÓRIO SEMANAL",
+                    weekly_rows
+                )
+            ):
+                set_meta("last_weekly_report_at", now)
+                print("[REPORT] semanal enviado")
+        else:
+            print("[REPORT] semanal aguardando dados")
 
 
 # ============================================================
@@ -2830,6 +2910,9 @@ def format_alert(candidate):
 
         f"*Qualidade:* "
         f"{candidate['quality']}",
+
+        f"*Radar:* "
+        f"{candidate.get('radar_tier', 'CORE')}",
 
         "",
 
@@ -2966,6 +3049,159 @@ def choose_best(candidates, now):
 
 
 # ============================================================
+# RADAR AMPLIADO — DESCOBERTA DE OPORTUNIDADES
+# ============================================================
+
+def radar_rank(ticker, history):
+    """Pontua uma moeda para entrar no funil profundo.
+
+    Não é o score do sinal. O objetivo aqui é descobrir movimentos
+    interessantes antes de aplicar os filtros HTF completos.
+    """
+    symbol = ticker["symbol"]
+    if symbol in ("BTC_USDT", "ETH_USDT"):
+        return -999.0
+
+    price = ticker["price"]
+    rise24 = ticker.get("rise", 0.0)
+    amount24 = ticker.get("amount24", 0.0)
+
+    r5 = r15 = 0.0
+    volx = 1.0
+    oix = 0.0
+
+    if history and len(history) >= 20:
+        r5 = get_returns(history)["r5"]
+        r15 = get_returns(history)["r15"]
+        volx = volume_ratio(history, 60)
+        oix = oi_change(history, 60)
+
+    # Movimento curto e aceleração são mais importantes que a variação 24h.
+    short_move = min(abs(r5) * 8.0, 24.0)
+    medium_move = min(abs(r15) * 4.0, 20.0)
+    volume_anomaly = min(max(volx - 1.0, 0.0) * 7.0, 21.0)
+    oi_anomaly = min(abs(oix) * 2.0, 10.0)
+    day_move = min(abs(rise24) * 0.35, 8.0)
+
+    # Log evita que uma Big Cap domine simplesmente pelo amount24.
+    liquidity = max(amount24, 1.0)
+    liquidity_score = min(max(__import__("math").log10(liquidity), 0.0), 10.0)
+
+    return (
+        short_move
+        + medium_move
+        + volume_anomaly
+        + oi_anomaly
+        + day_move
+        + liquidity_score
+    )
+
+
+def build_radar_universe(tickers):
+    """Monta um universo diversificado sem privilegiar apenas Big Caps."""
+    valid = [
+        t for t in tickers
+        if t.get("symbol", "").endswith("_USDT")
+        and t.get("amount24", 0) >= RADAR_MIN_AMOUNT24
+        and t.get("price", 0) > 0
+    ]
+
+    by_liquidity = sorted(
+        valid,
+        key=lambda t: t.get("amount24", 0),
+        reverse=True
+    )[:RADAR_LIQUIDITY_POOL]
+
+    by_mover = sorted(
+        valid,
+        key=lambda t: abs(t.get("rise", 0)),
+        reverse=True
+    )[:RADAR_MOVER_POOL]
+
+    # Low cap relativo: pegamos moedas fora do topo de liquidez,
+    # mas ainda com liquidez mínima para futuros.
+    liquidity_sorted = sorted(
+        valid,
+        key=lambda t: t.get("amount24", 0),
+        reverse=True
+    )
+    cutoff = max(1, int(len(liquidity_sorted) * 0.60))
+    lowcap_pool = liquidity_sorted[cutoff:]
+    lowcap_pool = sorted(
+        lowcap_pool,
+        key=lambda t: (
+            abs(t.get("rise", 0)),
+            t.get("amount24", 0)
+        ),
+        reverse=True
+    )[:RADAR_LOWCAP_POOL]
+
+    merged = {}
+    for t in by_liquidity + by_mover + lowcap_pool:
+        merged[t["symbol"]] = t
+
+    universe = list(merged.values())
+    universe.sort(
+        key=lambda t: t.get("amount24", 0),
+        reverse=True
+    )
+
+    return universe[:RADAR_UNIVERSE]
+
+
+def select_deep_candidates(tickers):
+    """Escolhe o funil profundo usando radar + diversidade de liquidez."""
+    universe = build_radar_universe(tickers)
+
+    ranked = []
+    for ticker in universe:
+        history = histories.get(ticker["symbol"])
+        score = radar_rank(ticker, history)
+        ranked.append((score, ticker))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    # O topo é por oportunidade relativa, não por amount24.
+    selected = [t for _, t in ranked[:MAX_CONTRACTS]]
+
+    # Garante uma pequena representação do universo low-cap,
+    # mesmo quando Big Caps estiverem dominando o radar.
+    lowcap_candidates = [
+        t for t in universe
+        if t.get("amount24", 0) < (
+            sorted([x.get("amount24", 0) for x in universe])
+            [max(0, int(len(universe) * 0.60) - 1)]
+            if universe else 0
+        )
+    ]
+
+    if lowcap_candidates:
+        lowcap_ranked = sorted(
+            lowcap_candidates,
+            key=lambda t: radar_rank(t, histories.get(t["symbol"])),
+            reverse=True
+        )
+        for lowcap in lowcap_ranked[:10]:
+            if lowcap not in selected:
+                selected[-1] = lowcap
+
+    return selected, universe, ranked
+
+def radar_tier(ticker, universe):
+    amounts = sorted(t.get("amount24", 0.0) for t in universe)
+    if not amounts:
+        return "CORE"
+    low_cut = amounts[max(0, int(len(amounts) * 0.40) - 1)]
+    high_cut = amounts[min(len(amounts) - 1, int(len(amounts) * 0.80))]
+    amount = ticker.get("amount24", 0.0)
+    if amount <= low_cut:
+        return "LOW CAP RADAR"
+    if amount >= high_cut:
+        return "BIG CAP"
+    return "MID CAP"
+
+
+# ============================================================
 # MONITOR PRINCIPAL
 # ============================================================
 
@@ -3067,39 +3303,16 @@ def monitor_loop():
                 )
 
             # ------------------------------------------------
-            # RANKING POR LIQUIDEZ
+            # RADAR AMPLIADO
             # ------------------------------------------------
 
-            ranked = sorted(
-                tickers,
+            radar_universe = build_radar_universe(tickers)
 
-                key=lambda ticker:
-                    ticker["amount24"],
+            # Guardamos histórico do universo do radar, não apenas das Big Caps.
+            # Assim uma low cap pode acumular contexto e subir para a análise profunda.
+            for ticker in radar_universe:
 
-                reverse=True
-            )
-
-            selected = [
-
-                ticker
-
-                for ticker
-                in ranked
-
-                if ticker["symbol"]
-                in contracts
-
-            ][:MAX_CONTRACTS]
-
-            # ------------------------------------------------
-            # HISTÓRICO
-            # ------------------------------------------------
-
-            for ticker in selected:
-
-                symbol = ticker[
-                    "symbol"
-                ]
+                symbol = ticker["symbol"]
 
                 history = histories.setdefault(
                     symbol,
@@ -3116,6 +3329,8 @@ def monitor_loop():
                         ticker["amount24"]
                     )
                 )
+
+            selected, radar_universe, radar_ranked = select_deep_candidates(tickers)
 
             # ------------------------------------------------
             # LABORATÓRIO
@@ -3180,6 +3395,10 @@ def monitor_loop():
                 )
 
                 if candidate:
+                    candidate["radar_tier"] = radar_tier(
+                        ticker,
+                        radar_universe
+                    )
 
                     candidates.append(
                         candidate
