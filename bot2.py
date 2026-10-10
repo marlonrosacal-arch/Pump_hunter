@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 # V5.4 — PUMP HUNTER / FUTURES RADAR
 # ============================================================
 
-VERSION = "V5.4.1"
+VERSION = "V5.5.0 — WAVETREND M15/H1 TEST"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -29,13 +29,21 @@ SCAN_INTERVAL = 5
 
 MAX_CONTRACTS = 50
 
-# Radar ampliado: o universo é muito maior que as moedas mais líquidas.
-# Primeiro fazemos descoberta ampla; só depois usamos a análise profunda.
+# Radar de low caps herdado da V5.4.1; universo amplo, análise profunda limitada.
 RADAR_UNIVERSE = 250
 RADAR_LIQUIDITY_POOL = 100
 RADAR_MOVER_POOL = 100
 RADAR_LOWCAP_POOL = 100
 RADAR_MIN_AMOUNT24 = 1000.0
+
+# WaveTrend [LazyBear] — parâmetros originais
+WT_CHANNEL_LENGTH = 10
+WT_AVERAGE_LENGTH = 21
+WT_SIGNAL_LENGTH = 4
+WT_OB1 = 60.0
+WT_OB2 = 53.0
+WT_OS1 = -60.0
+WT_OS2 = -53.0
 
 ALERT_INTERVAL = 60
 
@@ -45,6 +53,10 @@ CONTRACT_REFRESH = 15 * 60
 
 # Score mínimo para permitir alerta
 MIN_SCORE = 76
+
+# Novo filtro: detecta o começo do movimento, não apenas movimento já maduro.
+MIN_IGNITION_SCORE = 55
+MIN_CONTINUITY_SCORE = 60
 
 # Score considerado excepcional
 STRONG_SCORE = 86
@@ -108,7 +120,7 @@ db_lock = threading.Lock()
 # ============================================================
 
 HTF_REFRESH_SECONDS = 300
-HTF_SYMBOL_LIMIT = 30
+HTF_SYMBOL_LIMIT = 50
 HTF_INTERVALS = ("Min5", "Min15", "Min60", "Hour4")
 
 htf_cache = {}
@@ -241,6 +253,12 @@ def init_db():
             outcome TEXT,
 
             signal_number TEXT,
+
+            ignition_score REAL,
+            continuity_score REAL,
+            early_score REAL,
+            movement_stage TEXT,
+
             outcome_at REAL,
             outcome_elapsed REAL,
 
@@ -340,7 +358,11 @@ def init_db():
             "outcome_at": "REAL",
             "outcome_elapsed": "REAL",
 
-            "signal_number": "TEXT"
+            "signal_number": "TEXT",
+            "ignition_score": "REAL",
+            "continuity_score": "REAL",
+            "early_score": "REAL",
+            "movement_stage": "TEXT"
         }
 
         for name, definition in columns.items():
@@ -621,13 +643,75 @@ def fetch_kline(symbol, interval):
     )
 
 
+def wavetrend_values(rows, n1=WT_CHANNEL_LENGTH, n2=WT_AVERAGE_LENGTH, signal=WT_SIGNAL_LENGTH):
+    """WaveTrend LazyBear calculado sobre HLC3. Recebe candles ordenados por tempo."""
+    if len(rows) < n1 + n2 + signal + 5:
+        return None
+
+    ap = [(r["high"] + r["low"] + r["close"]) / 3.0 for r in rows]
+
+    def ema_series(values, period):
+        if len(values) < period:
+            return []
+        alpha = 2.0 / (period + 1.0)
+        seed = sum(values[:period]) / period
+        result = [None] * (period - 1) + [seed]
+        current = seed
+        for value in values[period:]:
+            current = (value - current) * alpha + current
+            result.append(current)
+        return result
+
+    esa = ema_series(ap, n1)
+    deviation = [abs(ap[i] - esa[i]) if esa[i] is not None else None for i in range(len(ap))]
+    valid_start = next((i for i, x in enumerate(deviation) if x is not None), len(ap))
+    d_tail = ema_series([x for x in deviation[valid_start:] if x is not None], n1)
+    d = [None] * valid_start + d_tail
+    ci = []
+    for i in range(len(ap)):
+        if esa[i] is None or d[i] is None or d[i] == 0:
+            ci.append(None)
+        else:
+            ci.append((ap[i] - esa[i]) / (0.015 * d[i]))
+
+    # Ignora o aquecimento inicial e calcula a EMA do CI contínuo.
+    start = next((i for i, x in enumerate(ci) if x is not None), len(ci))
+    ci_valid = [x for x in ci[start:] if x is not None]
+    tci_tail = ema_series(ci_valid, n2)
+    tci = [None] * start + tci_tail
+    wt1 = [x for x in tci]
+    wt2 = [None] * len(wt1)
+    for i in range(signal - 1, len(wt1)):
+        window = wt1[i - signal + 1:i + 1]
+        if all(x is not None for x in window):
+            wt2[i] = sum(window) / signal
+
+    valid = [i for i in range(len(wt1)) if wt1[i] is not None and wt2[i] is not None]
+    if len(valid) < 2:
+        return None
+    prev_i, cur_i = valid[-2], valid[-1]
+    prev_diff = wt1[prev_i] - wt2[prev_i]
+    cur_diff = wt1[cur_i] - wt2[cur_i]
+    cross_up = prev_diff <= 0 and cur_diff > 0
+    cross_down = prev_diff >= 0 and cur_diff < 0
+    return {
+        "wt1": wt1[cur_i], "wt2": wt2[cur_i],
+        "prev_wt1": wt1[prev_i], "prev_wt2": wt2[prev_i],
+        "cross_up": cross_up, "cross_down": cross_down,
+        "zone": "OVERSOLD" if wt1[cur_i] <= WT_OS2 else "OVERBOUGHT" if wt1[cur_i] >= WT_OB2 else "NEUTRAL"
+    }
+
+
 def analyze_timeframe(rows):
 
     if len(rows) < 25:
         return None
 
-    closes = [x["close"] for x in rows]
-    vols = [x["vol"] for x in rows]
+    # Exclui a vela em formação para reduzir cruzamentos falsos intrabar.
+    closed_rows = rows[:-1] if len(rows) > 30 else rows
+    closes = [x["close"] for x in closed_rows]
+    vols = [x["vol"] for x in closed_rows]
+    wt = wavetrend_values(closed_rows)
 
     e9 = ema(closes, 9)
     e21 = ema(closes, 21)
@@ -669,7 +753,8 @@ def analyze_timeframe(rows):
         "ema_slope": ema_slope,
         "volume_ratio": volume_ratio,
         "r3": r3,
-        "r6": r6
+        "r6": r6,
+        "wavetrend": wt
     }
 
 
@@ -1284,6 +1369,176 @@ def structure_analysis(history):
 
 
 # ============================================================
+# DETECÇÃO DE IGNIÇÃO
+# ============================================================
+
+def ignition_analysis(history, side, r5, r15, r30, rsi_current,
+                      rsi_delta, oi, vol_ratio, ema9, ema21,
+                      structure):
+    """
+    Detecta início de expansão direcional.
+
+    A ideia não é premiar simplesmente quem já subiu/caiu muito,
+    mas a mudança de estado: aceleração + volume + OI + RSI + estrutura,
+    mantendo baixa extensão do movimento.
+    """
+    prices = [x[1] for x in history]
+    current = prices[-1]
+
+    # Retorno dos 5s anteriores ao último bloco de 5s.
+    p5 = value_at(history, 5)
+    p10 = value_at(history, 10)
+    prev_r5 = pct_change(p10, p5) if p5 is not None and p10 is not None else 0.0
+    accel_now = r5 - prev_r5
+
+    # Volume e OI de curtíssimo prazo.
+    vol15 = volume_ratio(history, 15)
+    oi30 = oi_change(history, 30)
+
+    points = 0
+    reasons = []
+
+    if side == "LONG":
+        if accel_now > 0.02:
+            points += 18; reasons.append("aceleração")
+        elif accel_now > 0.005:
+            points += 10
+        if r5 > 0 and r15 >= -0.05:
+            points += 10
+        if vol15 >= 1.25:
+            points += 15; reasons.append("volume entrando")
+        elif vol15 >= 1.10:
+            points += 8
+        if oi30 > 0.03:
+            points += 10; reasons.append("OI acompanhando")
+        elif oi > 0:
+            points += 5
+        if rsi_delta > 0.5 and 45 <= rsi_current <= 68:
+            points += 12; reasons.append("RSI acelerando")
+        elif rsi_delta > 0:
+            points += 6
+        if current >= ema9 and current >= ema21:
+            points += 10; reasons.append("reclaim EMA")
+        elif current >= ema9:
+            points += 5
+        if structure.get("breakout"):
+            points += 15; reasons.append("micro rompimento")
+        # Penaliza movimento já esticado.
+        if r5 > 0.80:
+            points -= 15
+        elif r5 > 0.50:
+            points -= 8
+        if r30 > 2.0:
+            points -= 12
+    else:
+        if accel_now < -0.02:
+            points += 18; reasons.append("aceleração")
+        elif accel_now < -0.005:
+            points += 10
+        if r5 < 0 and r15 <= 0.05:
+            points += 10
+        if vol15 >= 1.25:
+            points += 15; reasons.append("volume entrando")
+        elif vol15 >= 1.10:
+            points += 8
+        if oi30 < -0.03:
+            points += 10; reasons.append("OI acompanhando")
+        elif oi < 0:
+            points += 5
+        if rsi_delta < -0.5 and 32 <= rsi_current <= 55:
+            points += 12; reasons.append("RSI acelerando")
+        elif rsi_delta < 0:
+            points += 6
+        if current <= ema9 and current <= ema21:
+            points += 10; reasons.append("reclaim EMA")
+        elif current <= ema9:
+            points += 5
+        if structure.get("breakdown") or structure.get("breakout"):
+            points += 15; reasons.append("micro rompimento")
+        if r5 < -0.80:
+            points -= 15
+        elif r5 < -0.50:
+            points -= 8
+        if r30 < -2.0:
+            points -= 12
+
+    ignition = max(0, min(100, points * 100 / 100))
+
+    # Estágio: quanto mais recente/leve a expansão, mais EARLY.
+    if side == "LONG":
+        if r5 <= 0 and accel_now <= 0:
+            stage = "PRE_IGNITION"
+        elif r5 < 0.30 and r30 < 1.0:
+            stage = "IGNITION"
+        elif r5 < 0.70 and r30 < 1.8:
+            stage = "DEVELOPING"
+        elif r5 < 1.20 and r30 < 2.8:
+            stage = "MATURE"
+        else:
+            stage = "EXHAUSTED"
+    else:
+        if r5 >= 0 and accel_now >= 0:
+            stage = "PRE_IGNITION"
+        elif r5 > -0.30 and r30 > -1.0:
+            stage = "IGNITION"
+        elif r5 > -0.70 and r30 > -1.8:
+            stage = "DEVELOPING"
+        elif r5 > -1.20 and r30 > -2.8:
+            stage = "MATURE"
+        else:
+            stage = "EXHAUSTED"
+
+    stage_bonus = {
+        "PRE_IGNITION": 100,
+        "IGNITION": 95,
+        "DEVELOPING": 75,
+        "MATURE": 45,
+        "EXHAUSTED": 15
+    }[stage]
+
+    # EARLY é uma medida separada; não substitui SCORE.
+    early = max(0, min(100, (ignition * 0.65) + (stage_bonus * 0.35)))
+
+    return {
+        "score": round(ignition, 1),
+        "early_score": round(early, 1),
+        "stage": stage,
+        "reasons": reasons,
+        "vol15": vol15,
+        "oi30": oi30,
+        "accel_now": accel_now
+    }
+
+
+def continuity_score(side, hs, tf15, tf1h, tf4h, vol15, vol1h, oi,
+                     r30, r60, rsi_current):
+    """Combustível provável para continuação, separado da qualidade da entrada."""
+    value = 0
+    direction = "BULLISH" if side == "LONG" else "BEARISH"
+
+    if hs.get("direction") == side:
+        value += 25
+    if tf15 and tf15.get("bias") == direction:
+        value += 20
+    if tf1h and tf1h.get("bias") == direction:
+        value += 20
+    if tf4h and tf4h.get("bias") == direction:
+        value += 10
+    if vol15 >= 1.15:
+        value += 8
+    if vol1h >= 1.05:
+        value += 5
+    if (side == "LONG" and oi > 0.03) or (side == "SHORT" and oi < -0.03):
+        value += 7
+    if (side == "LONG" and r30 > 0 and r60 > 0) or (side == "SHORT" and r30 < 0 and r60 < 0):
+        value += 5
+    if (side == "LONG" and 48 <= rsi_current <= 72) or (side == "SHORT" and 28 <= rsi_current <= 52):
+        value += 5
+
+    return max(0, min(100, value))
+
+
+# ============================================================
 # ANÁLISE PRINCIPAL
 # ============================================================
 
@@ -1342,6 +1597,22 @@ def analyze(symbol, history, ticker, market):
     # Não permitimos que um gatilho de poucos segundos escolha
     # sozinho a direção. Primeiro precisa existir um viés de 15m/1h/4h.
     if htf_direction is None:
+        return None
+
+    # --------------------------------------------------------
+    # WAVETREND M15 (gatilho) + H1 (contexto)
+    # --------------------------------------------------------
+    tf15_wt = (htf.get("15m") or {}).get("wavetrend")
+    tf1h_wt = (htf.get("1h") or {}).get("wavetrend")
+    if not tf15_wt or not tf1h_wt:
+        return None
+
+    # O sinal de teste exige cruzamento M15 recente e WT H1 do mesmo lado.
+    wt_long = bool(tf15_wt.get("cross_up")) and tf1h_wt["wt1"] > tf1h_wt["wt2"]
+    wt_short = bool(tf15_wt.get("cross_down")) and tf1h_wt["wt1"] < tf1h_wt["wt2"]
+    if htf_direction == "LONG" and not wt_long:
+        return None
+    if htf_direction == "SHORT" and not wt_short:
         return None
 
     # --------------------------------------------------------
@@ -1599,12 +1870,43 @@ def analyze(symbol, history, ticker, market):
 
     score = max(0, min(100, score))
 
+    # --------------------------------------------------------
+    # IGNIÇÃO / CONTINUIDADE
+    # --------------------------------------------------------
+
+    ignition = ignition_analysis(
+        history, htf_direction, r5, r15, r30, rsi_current,
+        rsi_delta, oi, vol_ratio, ema9, ema21, structure
+    )
+
+    cont = continuity_score(
+        htf_direction, hs, tf15, tf1h, tf4h,
+        ignition["vol15"], tf1h_vol, oi,
+        r30, r60, rsi_current
+    )
+
+    ignition_score = ignition["score"]
+    early_score = ignition["early_score"]
+    movement_stage = ignition["stage"]
+    continuity = cont
+
     if score < MIN_SCORE:
         return None
 
     # Trigger precisa estar minimamente alinhado; o HTF não deve gerar
     # alerta apenas porque as médias longas estão alinhadas.
     if trigger_score < 8:
+        return None
+
+    # A estratégia continua exigindo SCORE >= 76, mas agora também
+    # exige sinais de ignição e combustível. Isso reduz entradas tardias.
+    if ignition_score < MIN_IGNITION_SCORE:
+        return None
+
+    if continuity < MIN_CONTINUITY_SCORE:
+        return None
+
+    if movement_stage == "EXHAUSTED":
         return None
 
     side = htf_direction
@@ -1670,6 +1972,9 @@ def analyze(symbol, history, ticker, market):
         reasons.append("RSI subindo")
     if rsi_delta < 0 and side == "SHORT":
         reasons.append("RSI caindo")
+    for item in ignition["reasons"][:4]:
+        reasons.append(f"🔥 {item}")
+    reasons.append(f"Estágio {movement_stage}")
 
     return {
         "symbol": symbol,
@@ -1723,6 +2028,13 @@ def analyze(symbol, history, ticker, market):
         "volume_ratio": vol_ratio,
         "breakout": structure["breakout"],
         "false_breakout": structure["false_breakout"],
+        "ignition_score": ignition_score,
+        "continuity_score": continuity,
+        "early_score": early_score,
+        "movement_stage": movement_stage,
+        "ignition_vol15": ignition["vol15"],
+        "ignition_oi30": ignition["oi30"],
+        "ignition_accel": ignition["accel_now"],
         "regime": market["regime"],
         "reasons": reasons,
         "penalties": penalties,
@@ -1940,6 +2252,11 @@ def register_signal(candidate, detected_at):
             (signal_number, signal_id)
         )
 
+        conn.execute(
+            "UPDATE signals SET ignition_score=?, continuity_score=?, early_score=?, movement_stage=? WHERE id=?",
+            (candidate.get("ignition_score", 0), candidate.get("continuity_score", 0), candidate.get("early_score", 0), candidate.get("movement_stage", "UNKNOWN"), signal_id)
+        )
+
         conn.commit()
         conn.close()
 
@@ -2101,23 +2418,31 @@ def update_active_observations(tickers, now):
 
         fields = {}
 
-        if elapsed >= 30:
+        # Congela a primeira observação após cada horizonte; não sobrescreve
+        # um retorno de 5m/15m com valores de horas depois.
+        if elapsed >= 30 and obs.get("ret_30") is None:
             fields["ret_30"] = ret
+            obs["ret_30"] = ret
 
-        if elapsed >= 60:
+        if elapsed >= 60 and obs.get("ret_60") is None:
             fields["ret_60"] = ret
+            obs["ret_60"] = ret
 
-        if elapsed >= 180:
+        if elapsed >= 180 and obs.get("ret_180") is None:
             fields["ret_180"] = ret
+            obs["ret_180"] = ret
 
-        if elapsed >= 300:
+        if elapsed >= 300 and obs.get("ret_300") is None:
             fields["ret_300"] = ret
+            obs["ret_300"] = ret
 
-        if elapsed >= 600:
+        if elapsed >= 600 and obs.get("ret_600") is None:
             fields["ret_600"] = ret
+            obs["ret_600"] = ret
 
-        if elapsed >= 900:
+        if elapsed >= 900 and obs.get("ret_900") is None:
             fields["ret_900"] = ret
+            obs["ret_900"] = ret
 
         # ----------------------------------------------------
         # FINAL DA JANELA DE 24 HORAS
@@ -2135,11 +2460,8 @@ def update_active_observations(tickers, now):
 
             fields.update({
 
-                "mfe_900":
-                    obs["max_fav"],
-
-                "mae_900":
-                    obs["max_adv"],
+                # MFE/MAE de 15m não são inferíveis aqui a partir do extremo
+                # de 24h; não gravamos valores de 24h em colunas de 15m.
 
                 "max_fav":
                     obs["max_fav"],
@@ -2582,6 +2904,26 @@ def bucket_lines(rows):
         ),
 
         (
+            "Ignicao >= 60",
+            lambda r:
+                (r["ignition_score"] or 0)
+                >= 60
+        ),
+
+        (
+            "Continuidade >= 70",
+            lambda r:
+                (r["continuity_score"] or 0)
+                >= 70
+        ),
+
+        (
+            "Estagio IGNITION",
+            lambda r:
+                r["movement_stage"] == "IGNITION"
+        ),
+
+        (
             "HTF alinhado",
             lambda r:
                 (r["htf_score"] or 0)
@@ -2712,63 +3054,6 @@ def build_report(
     return "\n".join(text)
 
 
-def sent_rows_after(cursor_id, limit=100):
-    with db_lock:
-        conn = db_connect()
-        rows = conn.execute("""
-        SELECT * FROM signals
-        WHERE id > ?
-        AND alert_sent = 1
-        ORDER BY id ASC
-        LIMIT ?
-        """, (cursor_id, limit)).fetchall()
-        conn.close()
-    return rows
-
-
-def sent_status_counts():
-    with db_lock:
-        conn = db_connect()
-        row = conn.execute("""
-        SELECT
-            COUNT(*) AS sent,
-            SUM(CASE WHEN complete=1 THEN 1 ELSE 0 END) AS completed,
-            SUM(CASE WHEN complete=0 THEN 1 ELSE 0 END) AS active,
-            SUM(CASE WHEN outcome='GAIN' THEN 1 ELSE 0 END) AS gains,
-            SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END) AS losses,
-            SUM(CASE WHEN outcome='EXPIRED' THEN 1 ELSE 0 END) AS expired
-        FROM signals
-        WHERE alert_sent=1
-        """).fetchone()
-        conn.close()
-    return dict(row) if row else {
-        "sent": 0, "completed": 0, "active": 0,
-        "gains": 0, "losses": 0, "expired": 0
-    }
-
-
-def build_sent_block_report(title, block):
-    counts = sent_status_counts()
-    completed = [r for r in block if r["complete"] == 1]
-    gains = sum(1 for r in completed if r["outcome"] == "GAIN")
-    losses = sum(1 for r in completed if r["outcome"] == "LOSS")
-    expired = sum(1 for r in completed if r["outcome"] == "EXPIRED")
-
-    return "\n".join([
-        f"*{title}*",
-        "",
-        f"🚨 Alertas enviados neste bloco: *{len(block)}*",
-        f"📊 Concluídos até agora: *{counts['completed']}*",
-        f"⏳ Ainda em avaliação: *{counts['active']}*",
-        "",
-        f"🟢 GAIN concluídos no bloco: *{gains}*",
-        f"🔴 LOSS concluídos no bloco: *{losses}*",
-        f"🟡 EXPIRED concluídos no bloco: *{expired}*",
-        "",
-        "ℹ️ Este é o relatório de envio. O laboratório de performance continua separado e só considera sinais concluídos.",
-    ])
-
-
 # ============================================================
 # RELATÓRIOS AUTOMÁTICOS
 # ============================================================
@@ -2778,93 +3063,80 @@ def maybe_send_reports():
     now = time.time()
 
     # --------------------------------------------------------
-    # BLOCO DE 100 ALERTAS ENVIADOS
+    # BLOCO DE 100
     # --------------------------------------------------------
-    sent_cursor_raw = get_meta("last_sent_block_cursor_id", None)
 
-    if sent_cursor_raw is None:
-        with db_lock:
-            conn = db_connect()
-            row = conn.execute(
-                "SELECT MAX(id) AS max_id FROM signals WHERE alert_sent=1"
-            ).fetchone()
-            conn.close()
-        set_meta("last_sent_block_cursor_id", row["max_id"] or 0)
-        sent_cursor = int(row["max_id"] or 0)
-    else:
-        sent_cursor = int(float(sent_cursor_raw or 0))
+    cursor = int(
+        float(
+            get_meta(
+                "last_block_cursor_id",
+                0
+            ) or 0
+        )
+    )
 
-    sent_rows = sent_rows_after(
-        sent_cursor,
+    rows = completed_rows_after(
+        cursor,
         REPORT_BLOCK_SIZE
     )
 
-    counts = sent_status_counts()
-    if now % 300 < SCAN_INTERVAL:
-        print(
-            f"[REPORT] enviados={counts['sent']} | "
-            f"concluídos={counts['completed']} | "
-            f"ativos={counts['active']} | "
-            f"próximo_bloco={REPORT_BLOCK_SIZE}"
+    if len(rows) >= REPORT_BLOCK_SIZE:
+
+        block = rows[
+            :REPORT_BLOCK_SIZE
+        ]
+
+        title = (
+            "V5.5.0 WT — BLOCO "
+            f"{block[0]['id']}-"
+            f"{block[-1]['id']}"
         )
 
-    if len(sent_rows) >= REPORT_BLOCK_SIZE:
-        block = sent_rows[:REPORT_BLOCK_SIZE]
-        title = (
-            "V5.4.1 — ALERTAS "
-            f"{block[0]['id']}-{block[-1]['id']}"
-        )
-        if send_telegram(build_sent_block_report(title, block)):
-            set_meta("last_sent_block_cursor_id", block[-1]["id"])
-            print(
-                f"[REPORT] bloco enviado | "
-                f"ids={block[0]['id']}-{block[-1]['id']}"
+        if send_telegram(
+            build_report(
+                title,
+                block
+            )
+        ):
+
+            set_meta(
+                "last_block_cursor_id",
+                block[-1]["id"]
             )
 
     # --------------------------------------------------------
-    # LABORATÓRIO — BLOCO DE 100 CONCLUÍDOS
+    # SEMANAL
     # --------------------------------------------------------
-    lab_cursor = int(
-        float(get_meta("last_lab_cursor_id", 0) or 0)
-    )
-    lab_rows = completed_rows_after(
-        lab_cursor,
-        REPORT_BLOCK_SIZE
-    )
 
-    if len(lab_rows) >= REPORT_BLOCK_SIZE:
-        block = lab_rows[:REPORT_BLOCK_SIZE]
-        title = (
-            "V5.4.1 — LAB "
-            f"{block[0]['id']}-{block[-1]['id']}"
-        )
-        if send_telegram(build_report(title, block)):
-            set_meta("last_lab_cursor_id", block[-1]["id"])
-            print(
-                f"[REPORT] lab enviado | "
-                f"ids={block[0]['id']}-{block[-1]['id']}"
-            )
-
-    # --------------------------------------------------------
-    # SEMANAL — só consome a janela quando existe dado
-    # --------------------------------------------------------
     last_weekly = float(
-        get_meta("last_weekly_report_at", 0) or 0
+        get_meta(
+            "last_weekly_report_at",
+            0
+        ) or 0
     )
 
-    if now - last_weekly >= WEEKLY_SECONDS:
-        weekly_rows = completed_since(WEEKLY_SECONDS)
+    if (
+        now - last_weekly
+        >= WEEKLY_SECONDS
+    ):
+
+        weekly_rows = completed_since(
+            WEEKLY_SECONDS
+        )
+
         if weekly_rows:
             if send_telegram(
                 build_report(
-                    "V5.4.1 — RELATÓRIO SEMANAL",
+                    "V5.4.2 — RELATÓRIO SEMANAL",
                     weekly_rows
                 )
             ):
-                set_meta("last_weekly_report_at", now)
-                print("[REPORT] semanal enviado")
+                set_meta(
+                    "last_weekly_report_at",
+                    now
+                )
         else:
-            print("[REPORT] semanal aguardando dados")
+            print("[REPORT] semanal aguardando sinais concluídos")
 
 
 # ============================================================
@@ -2911,8 +3183,10 @@ def format_alert(candidate):
         f"*Qualidade:* "
         f"{candidate['quality']}",
 
-        f"*Radar:* "
-        f"{candidate.get('radar_tier', 'CORE')}",
+        f"🔥 *Ignição:* {candidate.get('ignition_score', 0):.0f}/100 | "
+        f"Early {candidate.get('early_score', 0):.0f}/100",
+        f"🚀 *Continuidade:* {candidate.get('continuity_score', 0):.0f}/100",
+        f"*Estágio:* {candidate.get('movement_stage', 'N/D')}",
 
         "",
 
@@ -3034,12 +3308,13 @@ def choose_best(candidates, now):
 
     available.sort(
         key=lambda candidate: (
+            candidate.get("continuity_score", 0),
+            candidate.get("ignition_score", 0),
+            candidate.get("early_score", 0),
             candidate["score"],
             candidate.get("htf_score", 0),
             candidate["quality"] == "STRONG",
-            candidate.get("htf_volume15", 0),
-            candidate["volume_ratio"],
-            abs(candidate["r15"])
+            candidate.get("htf_volume15", 0)
         ),
         reverse=True
     )
@@ -3102,6 +3377,7 @@ def build_radar_universe(tickers):
     valid = [
         t for t in tickers
         if t.get("symbol", "").endswith("_USDT")
+        and t.get("symbol") in contracts
         and t.get("amount24", 0) >= RADAR_MIN_AMOUNT24
         and t.get("price", 0) > 0
     ]
@@ -3199,6 +3475,7 @@ def radar_tier(ticker, universe):
     if amount >= high_cut:
         return "BIG CAP"
     return "MID CAP"
+
 
 
 # ============================================================
@@ -3303,32 +3580,20 @@ def monitor_loop():
                 )
 
             # ------------------------------------------------
-            # RADAR AMPLIADO
+            # RADAR AMPLIADO + HISTÓRICO (inclui low caps elegíveis)
             # ------------------------------------------------
 
             radar_universe = build_radar_universe(tickers)
 
-            # Guardamos histórico do universo do radar, não apenas das Big Caps.
-            # Assim uma low cap pode acumular contexto e subir para a análise profunda.
             for ticker in radar_universe:
-
                 symbol = ticker["symbol"]
-
                 history = histories.setdefault(
-                    symbol,
-                    deque(
-                        maxlen=MAX_HISTORY
-                    )
+                    symbol, deque(maxlen=MAX_HISTORY)
                 )
-
-                history.append(
-                    (
-                        ticker["timestamp"],
-                        ticker["price"],
-                        ticker["oi"],
-                        ticker["amount24"]
-                    )
-                )
+                history.append((
+                    ticker["timestamp"], ticker["price"],
+                    ticker["oi"], ticker["amount24"]
+                ))
 
             selected, radar_universe, radar_ranked = select_deep_candidates(tickers)
 
@@ -3395,10 +3660,6 @@ def monitor_loop():
                 )
 
                 if candidate:
-                    candidate["radar_tier"] = radar_tier(
-                        ticker,
-                        radar_universe
-                    )
 
                     candidates.append(
                         candidate
@@ -3455,7 +3716,10 @@ def monitor_loop():
                             f"SINAL #{signal_id:06d}",
                             best["side"],
                             best["symbol"],
-                            f"score={best['score']:.0f}"
+                            f"score={best['score']:.0f}",
+                            f"ignition={best.get('ignition_score',0):.0f}",
+                            f"cont={best.get('continuity_score',0):.0f}",
+                            f"stage={best.get('movement_stage','?')}"
                         )
 
                     else:
@@ -3475,7 +3739,7 @@ def monitor_loop():
 
                 print(
                     f"[SCAN] {scan_count} | "
-f"Monitoradas: {len(selected)}/{MAX_CONTRACTS} | "
+f"Radar: {len(radar_universe)} | Profundas: {len(selected)}/{MAX_CONTRACTS} | "
 f"Candidatos: {len(candidates)} | "
 f"melhor={best['symbol'] if best else 'nenhuma'} | "
 f"BTC15={market['btc15']:.2f}% | "
