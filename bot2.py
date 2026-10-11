@@ -3759,9 +3759,9 @@ def monitor_loop():
 f"Radar: {len(radar_universe)} | Profundas: {len(selected)}/{MAX_CONTRACTS} | "
 f"Candidatos: {len(candidates)} | "
 f"melhor={best['symbol'] if best else 'nenhuma'} | "
-f"BTC15={market['btc15']:.2f}% | "
-f"BTC60={market['btc60']:.2f}% | "
-f"regime={market['regime']}"
+f"BTC_HTF={market.get('btc_summary', {}).get('score', 0):.0f} | "
+f"ETH_HTF={market.get('eth_summary', {}).get('score', 0):.0f} | "
+f"regime={market.get('regime', 'UNKNOWN')}"
                 )
 
         except Exception as error:
