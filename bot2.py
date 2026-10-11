@@ -69,7 +69,7 @@ def scan_symbol(symbol):
         current_close = last_row['close']
         rsi_value = last_row['rsi']
         atr_value = last_row['atr']
-        coin_clean = symbol.split(':')[0] # Limpa o nome para o Telegram (Ex: SOL/USDT)
+        coin_clean = symbol.split(':')[0] # Limpa o nome para o Telegram (Ex: SOL)
 
         # Multiplicadores do ATR para posições seguras em Low Caps
         sl_distance = atr_value * 1.5
@@ -84,7 +84,7 @@ def scan_symbol(symbol):
             
             msg = (
                 f"🔥 *MEXC SCANNER - ALERTA DE LONG* 🔥\n\n"
-                f"🪙 *Ativo:* `{coin_clean}`\n"
+                f"🪙 *Ativo:* `{coin_clean}/USDT`\n"
                 f"📈 *Preço de Entrada:* `{current_close:.5f}`\n\n"
                 f"🛡️ *STOP LOSS:* `{sl:.5f}`\n"
                 f"🎯 *TAKE PROFIT 1:* `{tp1:.5f}` (Parcial)\n"
@@ -99,11 +99,11 @@ def scan_symbol(symbol):
         elif current_close < last_row['bb_low'] and 32 < rsi_value < 45:
             sl = current_close + sl_distance
             tp1 = current_close - tp1_distance
-            tp2 = current_close - deprecated = tp2_distance
+            tp2 = current_close - tp2_distance
             
             msg = (
                 f"📉 *MEXC SCANNER - ALERTA DE SHORT* 📉\n\n"
-                f"🪙 *Ativo:* `{coin_clean}`\n"
+                f"🪙 *Ativo:* `{coin_clean}/USDT`\n"
                 f"📉 *Preço de Entrada:* `{current_close:.5f}`\n\n"
                 f"🛡️ *STOP LOSS:* `{sl:.5f}`\n"
                 f"🎯 *TAKE PROFIT 1:* `{tp1:.5f}` (Parcial)\n"
