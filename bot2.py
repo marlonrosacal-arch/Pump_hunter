@@ -318,5 +318,21 @@ def run_scanner():
         time.sleep(120)
 
 
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "MEXC Scanner ativo!", 200
+
+
 if __name__ == "__main__":
-    run_scanner()
+    scanner_thread = threading.Thread(
+        target=run_scanner,
+        daemon=True
+    )
+    scanner_thread.start()
+
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
