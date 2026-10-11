@@ -2,8 +2,7 @@
 import os
 import time
 import threading
-from flask 
-import Flask
+from flask import Flask
 import requests
 import pandas as pd
 import ta
