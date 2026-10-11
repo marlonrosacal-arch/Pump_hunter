@@ -1,2 +1,6 @@
 requests
 flask
+ccxt
+pandas
+ta
+gunicorn
