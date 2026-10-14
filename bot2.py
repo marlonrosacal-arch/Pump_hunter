@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 # V5.4 — PUMP HUNTER / FUTURES RADAR
 # ============================================================
 
-VERSION = "V5.5.1 — WAVETREND ZERO + VOLUME TEST"
+VERSION = "V5.5.0 — WAVETREND M15/H1 TEST"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -1607,29 +1607,12 @@ def analyze(symbol, history, ticker, market):
     if not tf15_wt or not tf1h_wt:
         return None
 
-    # V5.5.1 TEST: cruzamento M15, lado do zero e confirmação H1.
-    # LONG só é permitido com WT1 M15 negativo; SHORT só com WT1 M15 positivo.
-    wt15_value = float(tf15_wt.get("wt1", 0.0))
-    wt_long = (
-        bool(tf15_wt.get("cross_up"))
-        and wt15_value < 0.0
-        and tf1h_wt["wt1"] > tf1h_wt["wt2"]
-    )
-    wt_short = (
-        bool(tf15_wt.get("cross_down"))
-        and wt15_value > 0.0
-        and tf1h_wt["wt1"] < tf1h_wt["wt2"]
-    )
+    # O sinal de teste exige cruzamento M15 recente e WT H1 do mesmo lado.
+    wt_long = bool(tf15_wt.get("cross_up")) and tf1h_wt["wt1"] > tf1h_wt["wt2"]
+    wt_short = bool(tf15_wt.get("cross_down")) and tf1h_wt["wt1"] < tf1h_wt["wt2"]
     if htf_direction == "LONG" and not wt_long:
         return None
     if htf_direction == "SHORT" and not wt_short:
-        return None
-
-    # Volume crescente obrigatório no M15: vela fechada >= 1,20x
-    # a média das 20 velas fechadas anteriores (20% acima da média).
-    tf15 = htf.get("15m") or {}
-    wt_volume_ratio = float(tf15.get("volume_ratio", 0.0) or 0.0)
-    if wt_volume_ratio < 1.20:
         return None
 
     # --------------------------------------------------------
@@ -3104,7 +3087,7 @@ def maybe_send_reports():
         ]
 
         title = (
-            "V5.5.1 WT — BLOCO "
+            "V5.5.0 WT — BLOCO "
             f"{block[0]['id']}-"
             f"{block[-1]['id']}"
         )
