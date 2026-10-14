@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 # V5.4 — PUMP HUNTER / FUTURES RADAR
 # ============================================================
 
-VERSION = "V5.5.0 — WAVETREND M15/H1 TEST"
+VERSION = "V5.6 — FAST IGNITION"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -52,11 +52,11 @@ COOLDOWN_SYMBOL = 8 * 60
 CONTRACT_REFRESH = 15 * 60
 
 # Score mínimo para permitir alerta
-MIN_SCORE = 76
+MIN_SCORE = 70
 
 # Novo filtro: detecta o começo do movimento, não apenas movimento já maduro.
-MIN_IGNITION_SCORE = 55
-MIN_CONTINUITY_SCORE = 60
+MIN_IGNITION_SCORE = 45
+MIN_CONTINUITY_SCORE = 45
 
 # Score considerado excepcional
 STRONG_SCORE = 86
@@ -124,6 +124,9 @@ HTF_SYMBOL_LIMIT = 50
 HTF_INTERVALS = ("Min5", "Min15", "Min60", "Hour4")
 
 htf_cache = {}
+# Estado do alerta de cruzamento RSI 5m > 63 por moeda.
+rsi63_previous = {}
+rsi63_alert_level = 63.0
 htf_symbols = []
 htf_lock = threading.Lock()
 last_htf_refresh = 0
@@ -818,6 +821,65 @@ def get_htf_context(symbol):
         return None
 
     return item.get("timeframes")
+
+
+def check_rsi63_crossings(selected, by_symbol):
+    """Avisa quando o RSI de 5m cruza de <=63 para >63.
+
+    A primeira leitura de cada moeda apenas inicializa o estado; isso evita
+    alertar moedas que já estavam acima de 63 quando o bot iniciou.
+    """
+    global rsi63_previous
+
+    crossed = []
+
+    for ticker in selected:
+        symbol = ticker.get("symbol")
+        if not symbol:
+            continue
+
+        context = get_htf_context(symbol)
+        tf5 = context.get("5m") if context else None
+        current = tf5.get("rsi") if tf5 else None
+        if current is None:
+            continue
+
+        try:
+            current = float(current)
+        except (TypeError, ValueError):
+            continue
+
+        previous = rsi63_previous.get(symbol)
+        rsi63_previous[symbol] = current
+
+        # Sem alerta na primeira observação; só alertar num cruzamento real.
+        if previous is not None and previous <= rsi63_alert_level < current:
+            live_ticker = by_symbol.get(symbol, ticker)
+            price = live_ticker.get("price", tf5.get("close", 0))
+            try:
+                price_text = f"{float(price):.10f}".rstrip("0").rstrip(".")
+            except (TypeError, ValueError):
+                price_text = str(price)
+
+            crossed.append(
+                f"• `{symbol}` | RSI 5m: {previous:.1f} → *{current:.1f}* | Preço: `{price_text}`"
+            )
+
+    if not crossed:
+        return 0
+
+    message = (
+        "📈 *ALERTA RSI — FORÇA COMPRADORA*\n"
+        "RSI de 5 minutos cruzou acima de 63:\n\n"
+        + "\n".join(crossed)
+        + "\n\n_Este alerta indica força de momentum; não confirma sozinho uma entrada LONG._"
+    )
+
+    if send_telegram(message):
+        print(f"[RSI63] {len(crossed)} cruzamento(s) RSI 5m acima de 63")
+        return len(crossed)
+
+    return 0
 
 
 def htf_summary(context):
@@ -1607,13 +1669,11 @@ def analyze(symbol, history, ticker, market):
     if not tf15_wt or not tf1h_wt:
         return None
 
-    # O sinal de teste exige cruzamento M15 recente e WT H1 do mesmo lado.
+    # V5.6 FAST IGNITION:
+    # WaveTrend vira confirmação auxiliar, não bloqueio obrigatório.
+    # Exigir cruzamento M15 fazia o alerta chegar depois do início do movimento.
     wt_long = bool(tf15_wt.get("cross_up")) and tf1h_wt["wt1"] > tf1h_wt["wt2"]
     wt_short = bool(tf15_wt.get("cross_down")) and tf1h_wt["wt1"] < tf1h_wt["wt2"]
-    if htf_direction == "LONG" and not wt_long:
-        return None
-    if htf_direction == "SHORT" and not wt_short:
-        return None
 
     # --------------------------------------------------------
     # GATILHO RÁPIDO — 20 PONTOS
@@ -1895,7 +1955,7 @@ def analyze(symbol, history, ticker, market):
 
     # Trigger precisa estar minimamente alinhado; o HTF não deve gerar
     # alerta apenas porque as médias longas estão alinhadas.
-    if trigger_score < 8:
+    if trigger_score < 6:
         return None
 
     # A estratégia continua exigindo SCORE >= 76, mas agora também
@@ -1906,15 +1966,22 @@ def analyze(symbol, history, ticker, market):
     if continuity < MIN_CONTINUITY_SCORE:
         return None
 
+    # WaveTrend alinhado reforça a leitura, mas não é requisito de entrada.
+    if (side := htf_direction) == "LONG" and wt_long:
+        score = min(100, score + 2)
+    elif side == "SHORT" and wt_short:
+        score = min(100, score + 2)
+
     if movement_stage == "EXHAUSTED":
         return None
 
     side = htf_direction
 
-    # Não perseguir preço já esticado no micro movimento.
-    if side == "LONG" and r5 > 1.2:
+    # Bloqueio menos rígido para não perder a ignição; evita apenas
+    # perseguir deslocamentos extremos no micro movimento.
+    if side == "LONG" and r5 > 1.8:
         return None
-    if side == "SHORT" and r5 < -1.2:
+    if side == "SHORT" and r5 < -1.8:
         return None
 
     resistance = structure["resistance"]
@@ -3596,6 +3663,10 @@ def monitor_loop():
                 ))
 
             selected, radar_universe, radar_ranked = select_deep_candidates(tickers)
+
+            # Alerta independente dos sinais LONG/SHORT: cruzamento do RSI 5m acima de 63.
+            # Usa o contexto de candles já mantido pelo thread HTF, sem novas chamadas à API.
+            check_rsi63_crossings(selected, by_symbol)
 
             # ------------------------------------------------
             # LABORATÓRIO
