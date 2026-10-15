@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 # V5.4 — PUMP HUNTER / FUTURES RADAR
 # ============================================================
 
-VERSION = "V5.6 — FAST IGNITION"
+VERSION = "V5.7 — FAST IGNITION + PAPER TRADING"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -84,6 +84,14 @@ WEEKLY_SECONDS = 7 * 24 * 60 * 60
 
 # Quantidade mínima para estatística de padrão
 MIN_PATTERN_SAMPLE = 15
+
+# Paper Trading: nenhuma ordem real é enviada à corretora.
+PAPER_TRADING_ENABLED = True
+PAPER_INITIAL_BALANCE = 100.0       # USDT
+PAPER_RISK_PCT = 0.01               # 1% do saldo virtual por operação
+PAPER_FEE_RATE = 0.0005             # estimativa: 0,05% por lado (configurável)
+PAPER_TP1_CLOSE_FRACTION = 0.50     # fecha 50% no TP1 e 50% no TP2
+PAPER_MAX_OPEN_TRADES = 5
 
 
 # ============================================================
@@ -373,6 +381,49 @@ def init_db():
                 conn.execute(
                     f"ALTER TABLE signals ADD COLUMN {name} {definition}"
                 )
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER UNIQUE,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            stop_price REAL NOT NULL,
+            tp1_price REAL NOT NULL,
+            tp2_price REAL NOT NULL,
+            qty_initial REAL NOT NULL,
+            qty_remaining REAL NOT NULL,
+            qty_tp1 REAL NOT NULL,
+            tp1_hit INTEGER DEFAULT 0,
+            gross_realized REAL DEFAULT 0,
+            fees_paid REAL DEFAULT 0,
+            net_pnl REAL,
+            status TEXT DEFAULT 'OPEN',
+            close_reason TEXT,
+            opened_at REAL NOT NULL,
+            closed_at REAL,
+            last_price REAL,
+            updated_at REAL
+        )
+        """)
+
+        # Saldo inicial persistente: não reinicia a cada deploy.
+        conn.execute("""
+        INSERT INTO analytics_meta(key, value)
+        VALUES ('paper_initial_balance', ?)
+        ON CONFLICT(key) DO NOTHING
+        """, (str(PAPER_INITIAL_BALANCE),))
+        conn.execute("""
+        INSERT INTO analytics_meta(key, value)
+        VALUES ('paper_last_block_count', '0')
+        ON CONFLICT(key) DO NOTHING
+        """)
+        conn.execute("""
+        INSERT INTO analytics_meta(key, value)
+        VALUES ('paper_last_weekly_report_at', ?)
+        ON CONFLICT(key) DO NOTHING
+        """, (str(time.time()),))
 
         conn.commit()
         conn.close()
@@ -3546,6 +3597,292 @@ def radar_tier(ticker, universe):
 
 
 # ============================================================
+# PAPER TRADING — SIMULAÇÃO SEM ORDENS REAIS
+# ============================================================
+
+def paper_balance():
+    """Saldo virtual = saldo inicial + PnL líquido de operações encerradas."""
+    with db_lock:
+        conn = db_connect()
+        initial_row = conn.execute(
+            "SELECT value FROM analytics_meta WHERE key='paper_initial_balance'"
+        ).fetchone()
+        pnl_row = conn.execute(
+            "SELECT COALESCE(SUM(net_pnl), 0) AS pnl FROM paper_trades WHERE status='CLOSED'"
+        ).fetchone()
+        conn.close()
+    initial = float(initial_row["value"]) if initial_row else PAPER_INITIAL_BALANCE
+    return initial + float(pnl_row["pnl"] or 0.0)
+
+
+def paper_stats():
+    with db_lock:
+        conn = db_connect()
+        rows = conn.execute("""
+        SELECT side, status, net_pnl, close_reason
+        FROM paper_trades
+        """).fetchall()
+        conn.close()
+    closed = [r for r in rows if r["status"] == "CLOSED"]
+    wins = sum(1 for r in closed if (r["net_pnl"] or 0) > 0)
+    losses = sum(1 for r in closed if (r["net_pnl"] or 0) < 0)
+    return {
+        "closed": len(closed),
+        "open": sum(1 for r in rows if r["status"] == "OPEN"),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": (100.0 * wins / len(closed)) if closed else 0.0,
+        "net_pnl": sum(float(r["net_pnl"] or 0.0) for r in closed),
+        "long_count": sum(1 for r in closed if r["side"] == "LONG"),
+        "short_count": sum(1 for r in closed if r["side"] == "SHORT"),
+        "long_pnl": sum(float(r["net_pnl"] or 0.0) for r in closed if r["side"] == "LONG"),
+        "short_pnl": sum(float(r["net_pnl"] or 0.0) for r in closed if r["side"] == "SHORT"),
+    }
+
+
+def paper_open_trade(signal_id, candidate):
+    """Abre posição virtual só depois que o alerta LONG/SHORT foi enviado."""
+    if not PAPER_TRADING_ENABLED:
+        return False
+    symbol = candidate.get("symbol")
+    side = candidate.get("side")
+    entry = float(candidate.get("entry") or 0)
+    stop = float(candidate.get("stop") or 0)
+    tp1 = float(candidate.get("tp1") or 0)
+    tp2 = float(candidate.get("tp2") or 0)
+    if not symbol or side not in ("LONG", "SHORT") or min(entry, stop, tp1, tp2) <= 0:
+        print(f"[PAPER] sinal {signal_id}: parâmetros inválidos; ignorado")
+        return False
+    risk_per_unit = (entry - stop) if side == "LONG" else (stop - entry)
+    if risk_per_unit <= 0:
+        print(f"[PAPER] sinal {signal_id}: stop do lado incorreto; ignorado")
+        return False
+
+    now = time.time()
+    with db_lock:
+        conn = db_connect()
+        existing = conn.execute("""
+            SELECT id FROM paper_trades WHERE signal_id=? OR (symbol=? AND status='OPEN')
+        """, (signal_id, symbol)).fetchone()
+        open_rows = conn.execute("SELECT symbol, qty_initial, entry_price FROM paper_trades WHERE status='OPEN'").fetchall()
+        conn.close()
+    if existing:
+        return False
+    if len(open_rows) >= PAPER_MAX_OPEN_TRADES:
+        print(f"[PAPER] limite de {PAPER_MAX_OPEN_TRADES} operações abertas; sinal {signal_id} não simulado")
+        return False
+
+    equity = paper_balance()
+    risk_budget = max(0.0, equity * PAPER_RISK_PCT)
+    qty_by_risk = risk_budget / risk_per_unit
+    # Sem alavancagem virtual definida: exposição conjunta não ultrapassa o saldo virtual.
+    used_notional = sum(float(r["qty_initial"] or 0) * float(r["entry_price"] or 0) for r in open_rows)
+    remaining_notional = max(0.0, equity - used_notional)
+    qty_by_notional = remaining_notional / entry if entry else 0.0
+    qty = min(qty_by_risk, qty_by_notional)
+    if qty <= 0:
+        print(f"[PAPER] sem exposição virtual disponível para {symbol}")
+        return False
+    qty_tp1 = qty * PAPER_TP1_CLOSE_FRACTION
+    entry_fee = entry * qty * PAPER_FEE_RATE
+    with db_lock:
+        conn = db_connect()
+        cur = conn.execute("""
+        INSERT INTO paper_trades (
+            signal_id, symbol, side, entry_price, stop_price, tp1_price, tp2_price,
+            qty_initial, qty_remaining, qty_tp1, tp1_hit, gross_realized, fees_paid,
+            status, opened_at, last_price, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 'OPEN', ?, ?, ?)
+        """, (signal_id, symbol, side, entry, stop, tp1, tp2, qty, qty, qty_tp1,
+              entry_fee, now, entry, now))
+        trade_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+    send_telegram(
+        f"🧪 *PAPER TRADING — ENTRADA #{trade_id:05d}*\n"
+        f"{'🟢' if side == 'LONG' else '🔴'} *{side} — {symbol}*\n"
+        f"Entrada simulada: `{entry:.8g}`\nStop: `{stop:.8g}`\n"
+        f"TP1: `{tp1:.8g}` (fecha 50%)\nTP2: `{tp2:.8g}` (fecha o restante)\n"
+        f"Quantidade virtual: `{qty:.8g}`\nRisco planejado: até `{risk_budget:.2f} USDT` (1% do saldo)\n"
+        f"Taxa estimada de entrada: `{entry_fee:.4f} USDT`\n"
+        f"Saldo virtual atual: `{equity:.2f} USDT`\n"
+        f"⚠️ Simulação; nenhuma ordem real foi enviada."
+    )
+    print(f"[PAPER OPEN] #{trade_id} {side} {symbol} qty={qty:.8g} entry={entry:.8g}")
+    return True
+
+
+def paper_close_quantity(conn, trade, qty, exit_price, now, reason):
+    """Fecha parte da quantidade, calcula PnL e taxa estimada da saída."""
+    qty = min(float(qty), float(trade["qty_remaining"] or 0.0))
+    if qty <= 0:
+        return None
+    entry = float(trade["entry_price"])
+    exit_price = float(exit_price)
+    side_sign = 1.0 if trade["side"] == "LONG" else -1.0
+    gross = (exit_price - entry) * qty * side_sign
+    exit_fee = exit_price * qty * PAPER_FEE_RATE
+    gross_total = float(trade["gross_realized"] or 0.0) + gross
+    fees_total = float(trade["fees_paid"] or 0.0) + exit_fee
+    remaining = max(0.0, float(trade["qty_remaining"] or 0.0) - qty)
+    closed = remaining <= max(1e-12, float(trade["qty_initial"]) * 1e-10)
+    net = gross_total - fees_total if closed else None
+    close_reason = reason if closed else None
+    conn.execute("""
+        UPDATE paper_trades
+        SET qty_remaining=?, gross_realized=?, fees_paid=?, net_pnl=?, status=?,
+            close_reason=?, closed_at=?, last_price=?, updated_at=?
+        WHERE id=?
+    """, (remaining, gross_total, fees_total, net, "CLOSED" if closed else "OPEN",
+          close_reason, now if closed else None, exit_price, now, trade["id"]))
+    return {
+        "trade_id": trade["id"], "symbol": trade["symbol"], "side": trade["side"],
+        "qty_closed": qty, "exit_price": exit_price, "gross": gross,
+        "exit_fee": exit_fee, "gross_total": gross_total, "fees_total": fees_total,
+        "net": net, "closed": closed, "reason": reason
+    }
+
+
+def update_paper_trades(tickers, now=None):
+    """Atualiza stops/alvos usando último preço recebido no ticker; não usa ordens reais."""
+    if not PAPER_TRADING_ENABLED:
+        return
+    now = now or time.time()
+    prices = {x.get("symbol"): float(x.get("price") or 0) for x in tickers}
+    events = []
+    with db_lock:
+        conn = db_connect()
+        trades = conn.execute("SELECT * FROM paper_trades WHERE status='OPEN' ORDER BY id").fetchall()
+        for trade in trades:
+            price = prices.get(trade["symbol"])
+            if not price or price <= 0:
+                continue
+            side = trade["side"]
+            stop = float(trade["stop_price"])
+            tp1 = float(trade["tp1_price"])
+            tp2 = float(trade["tp2_price"])
+            conn.execute("UPDATE paper_trades SET last_price=?, updated_at=? WHERE id=?", (price, now, trade["id"]))
+
+            # O preço atual pode estar além de TP2; contabiliza as saídas nos preços-alvo.
+            if side == "LONG":
+                stop_hit = price <= stop
+                tp1_hit = price >= tp1
+                tp2_hit = price >= tp2
+            else:
+                stop_hit = price >= stop
+                tp1_hit = price <= tp1
+                tp2_hit = price <= tp2
+
+            if stop_hit:
+                ev = paper_close_quantity(conn, trade, trade["qty_remaining"], stop, now, "STOP")
+                if ev: events.append(ev)
+                continue
+
+            current = conn.execute("SELECT * FROM paper_trades WHERE id=?", (trade["id"],)).fetchone()
+            if not current["tp1_hit"] and tp1_hit:
+                ev = paper_close_quantity(conn, current, min(current["qty_tp1"], current["qty_remaining"]), tp1, now, "TP1 (parcial 50%)")
+                if ev: events.append(ev)
+                conn.execute("UPDATE paper_trades SET tp1_hit=1 WHERE id=?", (trade["id"],))
+                current = conn.execute("SELECT * FROM paper_trades WHERE id=?", (trade["id"],)).fetchone()
+            if current and current["status"] == "OPEN" and tp2_hit:
+                ev = paper_close_quantity(conn, current, current["qty_remaining"], tp2, now, "TP2 (final)")
+                if ev: events.append(ev)
+        conn.commit()
+        conn.close()
+
+    for ev in events:
+        if ev["closed"]:
+            msg = (
+                f"{'✅' if (ev['net'] or 0) >= 0 else '🛑'} *PAPER TRADING — OPERAÇÃO ENCERRADA*\n"
+                f"{ev['side']} — *{ev['symbol']}* | Simulação #{ev['trade_id']:05d}\n"
+                f"Motivo: {ev['reason']}\nSaída: `{ev['exit_price']:.8g}`\n"
+                f"PnL bruto acumulado: `{ev['gross_total']:+.4f} USDT`\n"
+                f"Custos estimados acumulados: `{ev['fees_total']:.4f} USDT`\n"
+                f"*PnL líquido: `{ev['net']:+.4f} USDT`*\n"
+                f"Saldo virtual: `{paper_balance():.4f} USDT`"
+            )
+        else:
+            msg = (
+                f"🎯 *PAPER TRADING — TP1 ATINGIDO (PARCIAL)*\n"
+                f"{ev['side']} — *{ev['symbol']}* | Simulação #{ev['trade_id']:05d}\n"
+                f"Saída parcial: `{ev['exit_price']:.8g}`\n"
+                f"PnL bruto desta parcial: `{ev['gross']:+.4f} USDT`\n"
+                f"Taxa estimada: `{ev['exit_fee']:.4f} USDT`\n"
+                f"Quantidade restante segue até TP2 ou stop."
+            )
+        send_telegram(msg)
+        print(f"[PAPER {'CLOSED' if ev['closed'] else 'PARTIAL'}] #{ev['trade_id']} {ev['symbol']} {ev['reason']} net={ev['net']}")
+
+    paper_maybe_send_reports(now)
+
+
+def paper_maybe_send_reports(now=None):
+    now = now or time.time()
+    stats = paper_stats()
+    with db_lock:
+        conn = db_connect()
+        last_block_row = conn.execute("SELECT value FROM analytics_meta WHERE key='paper_last_block_count'").fetchone()
+        last_week_row = conn.execute("SELECT value FROM analytics_meta WHERE key='paper_last_weekly_report_at'").fetchone()
+        closed_count_row = conn.execute("SELECT COUNT(*) AS n FROM paper_trades WHERE status='CLOSED'").fetchone()
+        conn.close()
+    last_block = int(float(last_block_row["value"])) if last_block_row else 0
+    closed_count = int(closed_count_row["n"] or 0)
+    if closed_count - last_block >= 100:
+        with db_lock:
+            conn = db_connect()
+            rows = conn.execute("""
+                SELECT * FROM paper_trades WHERE status='CLOSED'
+                ORDER BY closed_at DESC, id DESC LIMIT 100
+            """).fetchall()
+            conn.close()
+        pnl = sum(float(r["net_pnl"] or 0.0) for r in rows)
+        wins = sum(1 for r in rows if float(r["net_pnl"] or 0.0) > 0)
+        longs = [r for r in rows if r["side"] == "LONG"]
+        shorts = [r for r in rows if r["side"] == "SHORT"]
+        report = (
+            "📊 *PAPER TRADING — RELATÓRIO DE 100 OPERAÇÕES*\n"
+            f"Operações encerradas: {len(rows)}\nVitórias: {wins} | Derrotas: {len(rows)-wins}\n"
+            f"Taxa de acerto: {(wins/len(rows)*100 if rows else 0):.1f}%\n"
+            f"PnL líquido do bloco: `{pnl:+.4f} USDT`\n"
+            f"LONG: {len(longs)} operações | `{sum(float(r['net_pnl'] or 0) for r in longs):+.4f} USDT`\n"
+            f"SHORT: {len(shorts)} operações | `{sum(float(r['net_pnl'] or 0) for r in shorts):+.4f} USDT`\n"
+            f"Saldo virtual atual: `{paper_balance():.4f} USDT`\n"
+            "Custos estimados descontados do PnL líquido."
+        )
+        if send_telegram(report):
+            set_meta("paper_last_block_count", closed_count)
+
+    last_week = float(last_week_row["value"]) if last_week_row else now
+    if now - last_week >= WEEKLY_SECONDS:
+        cutoff = now - WEEKLY_SECONDS
+        with db_lock:
+            conn = db_connect()
+            rows = conn.execute("""
+                SELECT * FROM paper_trades WHERE status='CLOSED' AND closed_at>=?
+                ORDER BY closed_at DESC
+            """, (cutoff,)).fetchall()
+            conn.close()
+        if rows:
+            wins = sum(1 for r in rows if float(r["net_pnl"] or 0) > 0)
+            pnl = sum(float(r["net_pnl"] or 0) for r in rows)
+            long_pnl = sum(float(r["net_pnl"] or 0) for r in rows if r["side"] == "LONG")
+            short_pnl = sum(float(r["net_pnl"] or 0) for r in rows if r["side"] == "SHORT")
+            report = (
+                "📅 *PAPER TRADING — RELATÓRIO SEMANAL*\n"
+                f"Operações encerradas: {len(rows)}\nVitórias: {wins} | Derrotas: {len(rows)-wins}\n"
+                f"Taxa de acerto: {(wins/len(rows)*100 if rows else 0):.1f}%\n"
+                f"PnL líquido semanal: `{pnl:+.4f} USDT`\n"
+                f"LONG: `{long_pnl:+.4f} USDT` | SHORT: `{short_pnl:+.4f} USDT`\n"
+                f"Saldo virtual: `{paper_balance():.4f} USDT`"
+            )
+            if send_telegram(report):
+                set_meta("paper_last_weekly_report_at", now)
+        else:
+            set_meta("paper_last_weekly_report_at", now)
+
+
+# ============================================================
 # MONITOR PRINCIPAL
 # ============================================================
 
@@ -3677,6 +4014,9 @@ def monitor_loop():
                 time.time()
             )
 
+            # Paper Trading acompanha stops/alvos de posições simuladas.
+            update_paper_trades(tickers, time.time())
+
             # ------------------------------------------------
             # CONTEXTO
             # ------------------------------------------------
@@ -3779,6 +4119,9 @@ def monitor_loop():
                     if sent:
 
                         mark_alert_sent(signal_id)
+
+                        # Só cria posição virtual após o sinal LONG/SHORT ter sido enviado.
+                        paper_open_trade(signal_id, best)
 
                         last_alert_global_local = time.time()
 
@@ -3947,7 +4290,15 @@ def status():
             len(contracts),
 
         "database":
-            DB_PATH
+            DB_PATH,
+        "paper_trading": {
+            "enabled": PAPER_TRADING_ENABLED,
+            "initial_balance_usdt": PAPER_INITIAL_BALANCE,
+            "balance_usdt": round(paper_balance(), 6),
+            "risk_pct": PAPER_RISK_PCT,
+            "fee_rate_per_side": PAPER_FEE_RATE,
+            **paper_stats()
+        }
     })
 
 
