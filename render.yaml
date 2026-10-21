@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: btc-paper-trading-50x
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    disk:
+      name: btc-paper-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DB_PATH
+        value: /var/data/paper_trading.db
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
